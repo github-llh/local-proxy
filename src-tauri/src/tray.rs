@@ -56,19 +56,16 @@ pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
 /// 创建隐藏的 popover / settings 窗口。
 fn create_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     // popover：无边框、置顶、不在任务栏显示
-    let popover = WebviewWindowBuilder::new(
-        app,
-        "popover",
-        tauri::WebviewUrl::App("index.html".into()),
-    )
-    .title("LocalProxy")
-    .inner_size(POPOVER_SIZE.0, POPOVER_SIZE.1)
-    .decorations(false)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .resizable(false)
-    .visible(false)
-    .build()?;
+    let popover =
+        WebviewWindowBuilder::new(app, "popover", tauri::WebviewUrl::App("index.html".into()))
+            .title("LocalProxy")
+            .inner_size(POPOVER_SIZE.0, POPOVER_SIZE.1)
+            .decorations(false)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .resizable(false)
+            .visible(false)
+            .build()?;
     // 失焦自动隐藏（菜单栏面板惯例）
     let popover_clone = popover.clone();
     popover.on_window_event(move |event| {
@@ -78,16 +75,12 @@ fn create_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // 设置窗口：常规装饰、居中
-    WebviewWindowBuilder::new(
-        app,
-        "settings",
-        tauri::WebviewUrl::App("index.html".into()),
-    )
-    .title("LocalProxy 设置")
-    .inner_size(SETTINGS_SIZE.0, SETTINGS_SIZE.1)
-    .center()
-    .visible(false)
-    .build()?;
+    WebviewWindowBuilder::new(app, "settings", tauri::WebviewUrl::App("index.html".into()))
+        .title("LocalProxy 设置")
+        .inner_size(SETTINGS_SIZE.0, SETTINGS_SIZE.1)
+        .center()
+        .visible(false)
+        .build()?;
 
     Ok(())
 }

@@ -7,6 +7,7 @@
 
 use tauri::Manager;
 
+mod autostart;
 mod commands;
 mod state;
 mod tray;
@@ -49,6 +50,7 @@ pub fn run() {
             commands::list_sessions,
             commands::get_config,
             commands::save_config,
+            commands::get_launch_at_login,
             commands::select_upstream,
         ])
         .run(tauri::generate_context!())

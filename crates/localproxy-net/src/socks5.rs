@@ -243,6 +243,144 @@ pub fn encode_address(host: &str) -> Result<(u8, Vec<u8>), Socks5Error> {
     Ok((consts::ATYP_DOMAIN, out))
 }
 
+// ============= 纯协议构造/解析（供 shim 就地协商复用） =============
+//
+// shim 注入场景下，被拦截的 fd/socket 已由应用创建，无法替换 fd 号
+// （Windows 无 dup2 等价物）。因此握手改为「原 socket 就地协商」：
+// 平台层负责 IO，协议字节的构造与解析统一收敛到这里。
+
+/// 构造方法协商问候（VER NMETHODS METHODS...）。
+pub fn build_greeting(auth: &ProxyAuth) -> Vec<u8> {
+    let has_auth = auth.has_credentials();
+    let mut methods = vec![consts::AUTH_NONE];
+    if has_auth {
+        methods.push(consts::AUTH_USERPASS);
+    }
+    let mut req = Vec::with_capacity(2 + methods.len());
+    req.push(consts::VERSION);
+    req.push(methods.len() as u8);
+    req.extend_from_slice(&methods);
+    req
+}
+
+/// 方法协商结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MethodChoice {
+    /// 无需认证
+    None,
+    /// 需要 RFC 1929 账密子协商
+    UserPass,
+}
+
+/// 解析方法协商响应（2 字节）。
+pub fn parse_method_response(buf: &[u8; 2]) -> Result<MethodChoice, Socks5Error> {
+    if buf[0] != consts::VERSION {
+        let looks_http = buf[0] == b'H';
+        return Err(Socks5Error::Protocol(format!(
+            "方法协商版本无效: {:#04x}{}",
+            buf[0],
+            if looks_http {
+                "（该端口返回了 HTTP 响应，是 HTTP 代理端口：请把代理类型改为 http）"
+            } else {
+                ""
+            }
+        )));
+    }
+    match buf[1] {
+        consts::AUTH_NONE => Ok(MethodChoice::None),
+        consts::AUTH_USERPASS => Ok(MethodChoice::UserPass),
+        other => Err(Socks5Error::Auth(format!(
+            "不支持的认证方式: {:#04x}",
+            other
+        ))),
+    }
+}
+
+/// 构造 RFC 1929 账密子协商请求。
+pub fn build_userpass_request(auth: &ProxyAuth) -> Result<Vec<u8>, Socks5Error> {
+    if auth.username.len() > 255 || auth.password.len() > 255 {
+        return Err(Socks5Error::Auth(
+            "用户名或密码长度超出 255 字节限制".to_string(),
+        ));
+    }
+    let mut req = Vec::with_capacity(3 + auth.username.len() + auth.password.len());
+    req.push(0x01);
+    req.push(auth.username.len() as u8);
+    req.extend_from_slice(auth.username.as_bytes());
+    req.push(auth.password.len() as u8);
+    req.extend_from_slice(auth.password.as_bytes());
+    Ok(req)
+}
+
+/// 解析账密子协商响应（2 字节，status 在 [1]）。
+pub fn parse_userpass_response(buf: &[u8; 2]) -> Result<(), Socks5Error> {
+    if buf[1] != 0x00 {
+        return Err(Socks5Error::Auth(format!(
+            "用户名或密码认证失败, status={}",
+            buf[1]
+        )));
+    }
+    Ok(())
+}
+
+/// 构造 CONNECT 请求。
+pub fn build_connect_request(host: &str, port: u16) -> Result<Vec<u8>, Socks5Error> {
+    let (atyp, addr_bytes) = encode_address(host)?;
+    let mut request = Vec::with_capacity(4 + addr_bytes.len() + 2);
+    request.push(consts::VERSION);
+    request.push(consts::CMD_CONNECT);
+    request.push(0x00);
+    request.push(atyp);
+    request.extend_from_slice(&addr_bytes);
+    request.extend_from_slice(&port.to_be_bytes());
+    Ok(request)
+}
+
+/// CONNECT/UDP-ASSOCIATE 响应解析结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplyHeader {
+    /// REPLY 码（0x00 = 成功）
+    pub rep: u8,
+    /// BND.ATYP
+    pub atyp: u8,
+    /// 地址部分字节数（ATYP_DOMAIN 需再读 1 字节长度）
+    pub addr_len: usize,
+}
+
+/// 解析响应头（4 字节：VER REP RSV ATYP）。
+pub fn parse_reply_header(buf: &[u8; 4]) -> Result<ReplyHeader, Socks5Error> {
+    if buf[0] != consts::VERSION {
+        return Err(Socks5Error::Protocol(format!(
+            "响应版本无效: {:#04x}",
+            buf[0]
+        )));
+    }
+    let addr_len = match buf[3] {
+        consts::ATYP_IPV4 => 4,
+        consts::ATYP_IPV6 => 16,
+        consts::ATYP_DOMAIN => usize::MAX, // 长度字节待读
+        other => return Err(Socks5Error::Protocol(format!("未知 ATYP: {other}"))),
+    };
+    Ok(ReplyHeader {
+        rep: buf[1],
+        atyp: buf[3],
+        addr_len,
+    })
+}
+
+/// 响应成功后需要消费的剩余字节数（addr + port）。
+pub fn reply_tail_len(atyp: u8, domain_len: Option<u8>) -> Option<usize> {
+    match atyp {
+        consts::ATYP_IPV4 => Some(4 + 2),
+        consts::ATYP_IPV6 => Some(16 + 2),
+        consts::ATYP_DOMAIN => {
+            let len = domain_len? as usize;
+            Some(len + 2)
+        }
+        _ => None,
+    }
+}
+
 /// 读取 CONNECT/UDP-ASSOCIATE 响应，消费 BND.ADDR/PORT，返回 (REP, BND 地址)。
 fn read_reply(
     stream: &mut TcpStream,

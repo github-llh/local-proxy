@@ -11,9 +11,7 @@ use localproxy_core::config::AppConfig;
 use localproxy_launcher::app_entry::AppEntry;
 use tauri::State;
 
-use crate::state::{
-    core_running, kill_core, shim_binary_path, spawn_core, AppSession, AppState,
-};
+use crate::state::{core_running, kill_core, shim_binary_path, spawn_core, AppSession, AppState};
 
 /// 核心运行状态（popover 展示）。
 #[derive(serde::Serialize)]
@@ -44,9 +42,7 @@ pub fn get_status(state: State<'_, AppState>) -> CoreStatus {
     let (pid, uptime) = {
         let guard = state.core.lock().unwrap();
         match guard.as_ref() {
-            Some(core) if running => {
-                (Some(core.child.id()), core.started_at.elapsed().as_secs())
-            }
+            Some(core) if running => (Some(core.child.id()), core.started_at.elapsed().as_secs()),
             _ => (None, 0),
         }
     };
@@ -60,9 +56,7 @@ pub fn get_status(state: State<'_, AppState>) -> CoreStatus {
         active_upstream: upstream
             .map(|s| s.name.clone())
             .unwrap_or_else(|| "未配置".to_string()),
-        upstream_type: upstream
-            .map(|s| s.server_type.clone())
-            .unwrap_or_default(),
+        upstream_type: upstream.map(|s| s.server_type.clone()).unwrap_or_default(),
     }
 }
 
@@ -141,7 +135,12 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             .find(|a| a.id == id)
             .cloned()
             .ok_or_else(|| "应用不存在".to_string())?;
-        (entry, config.listen_host.clone(), config.socks5_port, "198.18.0.0/15".to_string())
+        (
+            entry,
+            config.listen_host.clone(),
+            config.socks5_port,
+            "198.18.0.0/15".to_string(),
+        )
     };
 
     // 核心必须在线（shim 拨号目标）
@@ -166,7 +165,11 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
         pid: session.pid,
         uptime_secs: 0,
     };
-    state.sessions.lock().map_err(|e| e.to_string())?.push(session);
+    state
+        .sessions
+        .lock()
+        .map_err(|e| e.to_string())?
+        .push(session);
     Ok(info)
 }
 
@@ -181,8 +184,8 @@ fn launch_via_platform(
 ) -> Result<crate::state::AppSession, String> {
     use localproxy_launcher::macos;
 
-    let session = macos::launch(entry, shim, core_host, core_port, fakeip_cidr)
-        .map_err(|e| e.to_string())?;
+    let session =
+        macos::launch(entry, shim, core_host, core_port, fakeip_cidr).map_err(|e| e.to_string())?;
     Ok(crate::state::AppSession {
         entry_id: session.entry_id,
         entry_name: entry.name.clone(),
@@ -234,12 +237,37 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 }
 
 /// 保存完整配置（设置窗口保存按钮）。
+///
+/// 若 `ui.launch_at_login` 与系统实际状态不一致，同步系统开机自启设置。
 #[tauri::command]
 pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), String> {
+    let launch_at_login = config.ui.launch_at_login;
     let mut current = state.config.lock().map_err(|e| e.to_string())?;
+    let login_changed = current.ui.launch_at_login != launch_at_login;
     *current = config;
     drop(current);
-    state.save_config()
+    state.save_config()?;
+
+    if login_changed {
+        let result = if launch_at_login {
+            crate::autostart::enable()
+        } else {
+            crate::autostart::disable()
+        };
+        if let Err(e) = result {
+            // 自启设置失败不阻塞配置保存，回滚内存标记
+            let mut current = state.config.lock().map_err(|e| e.to_string())?;
+            current.ui.launch_at_login = !launch_at_login;
+            return Err(format!("开机自启设置失败: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// 查询系统开机自启实际状态。
+#[tauri::command]
+pub fn get_launch_at_login() -> bool {
+    crate::autostart::is_enabled()
 }
 
 /// 切换激活上游（热切换，不影响已建连接）。

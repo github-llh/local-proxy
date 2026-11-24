@@ -76,6 +76,41 @@ unsafe fn parse_sockaddr(addr: *const libc::sockaddr, len: libc::socklen_t) -> O
     }
 }
 
+// ============= 平台 SockIo 实现 =============
+
+/// macOS 平台 IO（libc connect/read/write）。
+struct MacOsIo;
+
+impl engine::SockIo for MacOsIo {
+    unsafe fn raw_connect(&self, fd: i64, addr: *const u8, len: u32) -> i32 {
+        // SAFETY: 由引擎约定 addr/len 有效
+        unsafe {
+            libc::connect(
+                fd as i32,
+                addr as *const libc::sockaddr,
+                len as libc::socklen_t,
+            )
+        }
+    }
+
+    unsafe fn raw_read(&self, fd: i64, buf: *mut u8, len: usize) -> isize {
+        // SAFETY: 由引擎约定 buf 可写 len 字节
+        unsafe { libc::read(fd as i32, buf as *mut libc::c_void, len) as isize }
+    }
+
+    unsafe fn raw_write(&self, fd: i64, buf: *const u8, len: usize) -> isize {
+        // SAFETY: 由引擎约定 buf 可读 len 字节
+        unsafe { libc::write(fd as i32, buf as *const libc::c_void, len) as isize }
+    }
+
+    fn core_addr(&self) -> Option<SocketAddr> {
+        // 核心地址必须是 IP 字面量（域名会经 getaddrinfo hook 拿到 FakeIP，形成环）
+        engine::config().core_endpoint().parse().ok()
+    }
+}
+
+static IO: MacOsIo = MacOsIo;
+
 // ============= hook: connect =============
 
 /// `connect` 替换实现。
@@ -87,7 +122,7 @@ pub extern "C" fn localproxy_connect(
 ) -> c_int {
     ensure_installed();
 
-    // 重入防护：SOCKS5 拨号内部会调 connect，必须放行
+    // 重入防护：核心拨号内部会调 connect，必须放行
     let Some(_guard) = engine::HookGuard::enter() else {
         return unsafe { connect(fd, addr, len) };
     };
@@ -97,13 +132,12 @@ pub extern "C" fn localproxy_connect(
         return unsafe { connect(fd, addr, len) };
     };
 
-    match engine::proxy_connect(fd, &target) {
-        Ok(Some(0)) => 0,                           // 已代理成功
-        Ok(_) => unsafe { connect(fd, addr, len) }, // 直连放行
-        Err(e) => {
+    match engine::proxy_connect(&IO, fd as i64, &target) {
+        Ok(true) => 0,                                  // 已就地代理成功
+        Ok(false) => unsafe { connect(fd, addr, len) }, // 直连放行
+        Err(_) => {
             // 以 ECONNREFUSED 语义失败（应用侧表现与普通连接失败一致）
             unsafe { *libc::__error() = libc::ECONNREFUSED };
-            let _ = e;
             -1
         }
     }

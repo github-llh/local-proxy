@@ -3,9 +3,11 @@ name = "localproxy-shim"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "LocalProxy 注入 shim 公共逻辑：FakeIP 映射、SOCKS5 拨号、重入防护、平台抽象"
+description = "LocalProxy 注入 shim 公共逻辑：FakeIP 映射、SOCKS5 就地协商、重入防护、平台抽象"
 
 [dependencies]
 localproxy-net = { workspace = true }
-libc = "0.2"
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }
