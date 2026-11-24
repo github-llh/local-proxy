@@ -10,6 +10,7 @@
  * 输出：stderr 打印解析与连接过程；stdout 打印 HTTP 响应。
  */
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -54,11 +55,30 @@ static int udp_probe(const char *host, const char *port) {
     return 0;
 }
 
+/// DNS 探测：gethostbyname 打印 h_name 与首个地址（验证 FakeIP 覆盖旁路 API）。
+static int dns_probe(const char *host) {
+    struct hostent *he = gethostbyname(host);
+    if (he == NULL) {
+        printf("GETHOSTBYNAME_NULL\n");
+        return 1;
+    }
+    char ipstr[64] = {0};
+    if (he->h_addr_list != NULL && he->h_addr_list[0] != NULL) {
+        inet_ntop(he->h_addrtype, he->h_addr_list[0], ipstr, sizeof(ipstr));
+    }
+    printf("GETHOSTBYNAME name=%s addr=%s\n", he->h_name ? he->h_name : "(null)", ipstr);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--udp") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";
         const char *port = argc > 3 ? argv[3] : "3478";
         return udp_probe(host, port);
+    }
+    if (argc >= 2 && strcmp(argv[1], "--dns") == 0) {
+        const char *host = argc > 2 ? argv[2] : "example.com";
+        return dns_probe(host);
     }
 
     const char *host = argc > 1 ? argv[1] : "example.com";

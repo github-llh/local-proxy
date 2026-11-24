@@ -117,5 +117,19 @@ if grep -qv "127.0.0.1" "$UDP_SEEN_FILE" 2>/dev/null; then
 fi
 echo "PASS: mock UDP 仅收到回环包（无泄漏）"
 
+echo "== 9. DNS 旁路 API 断言（gethostbyname 泄漏面） =="
+# 9.1 注入后 gethostbyname 必须返回 FakeIP（否则老库/运行时走真实 DNS）
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  /tmp/lp-e2e-client --dns example.com > /tmp/lp-e2e-dns.txt 2>/dev/null || true
+grep -q "GETHOSTBYNAME name=example.com addr=198\.18\." /tmp/lp-e2e-dns.txt \
+  && echo "PASS: gethostbyname 返回 FakeIP + 域名（旁路 API 已覆盖）" \
+  || { echo "FAIL: gethostbyname 未被覆盖"; cat /tmp/lp-e2e-dns.txt; exit 1; }
+# 9.2 本地域名走真实解析（不误伤）
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  /tmp/lp-e2e-client --dns localhost > /tmp/lp-e2e-dns-local.txt 2>/dev/null || true
+grep -q "GETHOSTBYNAME name=localhost addr=127\.0\.0\.1" /tmp/lp-e2e-dns-local.txt \
+  && echo "PASS: localhost 走真实解析（不误伤）" \
+  || { echo "FAIL: localhost 解析异常"; cat /tmp/lp-e2e-dns-local.txt; exit 1; }
+
 echo ""
 echo "===== M2 端到端验证全部通过 ====="

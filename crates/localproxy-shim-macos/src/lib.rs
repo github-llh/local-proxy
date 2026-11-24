@@ -46,7 +46,24 @@ extern "C" {
         tolen: libc::socklen_t,
     ) -> isize;
     fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize;
+    fn gethostbyname(name: *const c_char) -> *mut libc::hostent;
+    fn gethostbyname2(name: *const c_char, af: c_int) -> *mut libc::hostent;
+    fn getnameinfo(
+        sa: *const libc::sockaddr,
+        salen: libc::socklen_t,
+        host: *mut c_char,
+        hostlen: libc::socklen_t,
+        serv: *mut c_char,
+        servlen: libc::socklen_t,
+        flags: c_int,
+    ) -> c_int;
 }
+
+/// getnameinfo flags（macOS ABI 稳定值）。
+const NI_NOFQDN: c_int = 1;
+const NI_NUMERICHOST: c_int = 2;
+const NI_NAMEREQD: c_int = 4;
+const NI_NUMERICSERV: c_int = 8;
 
 /// 查询 socket 类型（SO_TYPE）；失败返回 None。
 unsafe fn getsockopt_type(fd: RawFd) -> Option<c_int> {
@@ -376,6 +393,172 @@ pub extern "C" fn localproxy_getaddrinfo(
     0 // 成功
 }
 
+// ============= hook: gethostbyname / getnameinfo（DNS API 补齐 P0.3） =============
+
+/// 线程局部 FakeIP hostent 存储（自引用结构，Box 固定地址）。
+struct FakeHostent {
+    name: std::ffi::CString,
+    addr: [u8; 4],
+    aliases: [*mut c_char; 1],
+    addr_list: [*mut c_char; 2],
+    hostent: libc::hostent,
+}
+
+thread_local! {
+    static FAKE_HOSTENT: std::cell::RefCell<Option<*mut FakeHostent>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// 构造（或重建）指向 FakeIP 的 hostent，返回稳定指针。
+///
+/// 与 getaddrinfo 完全一致的放行条件；`localhost`/`.local`/回环/私网走原函数。
+unsafe fn build_fake_hostent(host: &str, ip: [u8; 4]) -> Option<*mut libc::hostent> {
+    let name = std::ffi::CString::new(host).ok()?;
+    let mut cell = Box::new(FakeHostent {
+        name,
+        addr: ip,
+        aliases: [std::ptr::null_mut()],
+        addr_list: [std::ptr::null_mut(), std::ptr::null_mut()],
+        // SAFETY: hostent 为 POD，零初始化合法
+        hostent: unsafe { std::mem::zeroed() },
+    });
+    cell.addr_list[0] = cell.addr.as_mut_ptr() as *mut c_char;
+    // unsafe fn 体内默认处于 unsafe 上下文（edition 2024 语义）
+    cell.hostent.h_name = cell.name.as_ptr() as *mut c_char;
+    cell.hostent.h_addrtype = 2; // AF_INET
+    cell.hostent.h_length = 4;
+    cell.hostent.h_aliases = cell.aliases.as_mut_ptr();
+    cell.hostent.h_addr_list = cell.addr_list.as_mut_ptr();
+    let box_ptr = Box::into_raw(cell);
+    let hostent_ptr: *mut libc::hostent = &raw mut (*box_ptr).hostent;
+    FAKE_HOSTENT.with(|slot| {
+        // 释放上一次的 Box（保持每线程至多一份）
+        if let Some(old) = slot.borrow_mut().replace(box_ptr) {
+            // SAFETY: old 来自上一次 Box::into_raw
+            drop(unsafe { Box::from_raw(old) });
+        }
+    });
+    Some(hostent_ptr)
+}
+
+/// `gethostbyname` 替换实现：非本地域名返回 FakeIP hostent。
+#[no_mangle]
+pub extern "C" fn localproxy_gethostbyname(name: *const c_char) -> *mut libc::hostent {
+    ensure_installed();
+
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return unsafe { gethostbyname(name) };
+    };
+    if name.is_null() {
+        return unsafe { gethostbyname(name) };
+    }
+    // SAFETY: name 为 NUL 结尾字符串
+    let Ok(host) = (unsafe { std::ffi::CStr::from_ptr(name) }).to_str() else {
+        return unsafe { gethostbyname(name) };
+    };
+    if !engine::should_fakeip(host) {
+        return unsafe { gethostbyname(name) };
+    }
+    match engine::fakeip_assign(host) {
+        Some(ip) => unsafe { build_fake_hostent(host, ip.to_be_bytes()) }
+            .unwrap_or_else(|| unsafe { gethostbyname(name) }),
+        None => unsafe { gethostbyname(name) },
+    }
+}
+
+/// `gethostbyname2` 替换实现：仅处理 AF_INET。
+#[no_mangle]
+pub extern "C" fn localproxy_gethostbyname2(name: *const c_char, af: c_int) -> *mut libc::hostent {
+    ensure_installed();
+
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return unsafe { gethostbyname2(name, af) };
+    };
+    if af != 2 || name.is_null() {
+        return unsafe { gethostbyname2(name, af) };
+    }
+    // SAFETY: name 为 NUL 结尾字符串
+    let Ok(host) = (unsafe { std::ffi::CStr::from_ptr(name) }).to_str() else {
+        return unsafe { gethostbyname2(name, af) };
+    };
+    if !engine::should_fakeip(host) {
+        return unsafe { gethostbyname2(name, af) };
+    }
+    match engine::fakeip_assign(host) {
+        Some(ip) => unsafe { build_fake_hostent(host, ip.to_be_bytes()) }
+            .unwrap_or_else(|| unsafe { gethostbyname2(name, af) }),
+        None => unsafe { gethostbyname2(name, af) },
+    }
+}
+
+/// `getnameinfo` 替换实现：反查 FakeIP → 返回映射域名（消除 198.18.x.x 字面量暴露）。
+#[no_mangle]
+pub extern "C" fn localproxy_getnameinfo(
+    sa: *const libc::sockaddr,
+    salen: libc::socklen_t,
+    host: *mut c_char,
+    hostlen: libc::socklen_t,
+    serv: *mut c_char,
+    servlen: libc::socklen_t,
+    flags: c_int,
+) -> c_int {
+    ensure_installed();
+
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return unsafe { getnameinfo(sa, salen, host, hostlen, serv, servlen, flags) };
+    };
+
+    // 解析地址；非 FakeIP → 原函数
+    // SAFETY: 调用方保证 sa/salen 有效
+    let target = unsafe { parse_sockaddr(sa, salen) };
+    let fake_domain = match &target {
+        Some(SocketAddr::V4(v4)) => {
+            let ip = u32::from(*v4.ip());
+            if engine::is_fakeip(ip) {
+                engine::fakeip_domain_for(ip)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    };
+    let Some(domain) = fake_domain else {
+        return unsafe { getnameinfo(sa, salen, host, hostlen, serv, servlen, flags) };
+    };
+    // NI_NUMERICHOST 明确要数字形式：放行原函数
+    if flags & NI_NUMERICHOST != 0 {
+        return unsafe { getnameinfo(sa, salen, host, hostlen, serv, servlen, flags) };
+    }
+
+    // host ← 映射域名
+    if !host.is_null() && hostlen > 0 {
+        let domain_c = std::ffi::CString::new(domain.clone()).unwrap_or_default();
+        // SAFETY: host 缓冲区由调用方提供，hostlen 为其容量
+        unsafe {
+            libc::strncpy(
+                host,
+                domain_c.as_ptr(),
+                (hostlen as usize).saturating_sub(1),
+            );
+            *host.add(hostlen as usize - 1) = 0;
+        }
+    }
+    // serv ← 端口数字（NI_NAMEREQD 语义下服务名查询对 FakeIP 无意义）
+    if !serv.is_null() && servlen > 0 {
+        if let Some(SocketAddr::V4(v4)) = &target {
+            let port = v4.port().to_string();
+            let port_c = std::ffi::CString::new(port).unwrap_or_default();
+            // SAFETY: serv 缓冲区由调用方提供
+            unsafe {
+                libc::strncpy(serv, port_c.as_ptr(), (servlen as usize).saturating_sub(1));
+                *serv.add(servlen as usize - 1) = 0;
+            }
+        }
+    }
+    let _ = (NI_NOFQDN, NI_NAMEREQD, NI_NUMERICSERV);
+    0
+}
+
 // ============= interpose 段 =============
 
 /// `__DATA,__interpose` 段条目：(replacement, original)。
@@ -419,6 +602,27 @@ static INTERPOSE_SENDTO: InterposePair = InterposePair {
 static INTERPOSE_SENDMSG: InterposePair = InterposePair {
     replacement: localproxy_sendmsg as *const c_void,
     original: sendmsg as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_GETHOSTBYNAME: InterposePair = InterposePair {
+    replacement: localproxy_gethostbyname as *const c_void,
+    original: gethostbyname as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_GETHOSTBYNAME2: InterposePair = InterposePair {
+    replacement: localproxy_gethostbyname2 as *const c_void,
+    original: gethostbyname2 as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_GETNAMEINFO: InterposePair = InterposePair {
+    replacement: localproxy_getnameinfo as *const c_void,
+    original: getnameinfo as *const c_void,
 };
 
 /// shim 构造入口（供测试或手动初始化）。

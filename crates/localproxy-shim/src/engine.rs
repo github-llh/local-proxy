@@ -180,6 +180,23 @@ pub fn parse_service_port(service: Option<&str>) -> u16 {
     }
 }
 
+// ============= DNS API 辅助（P0.3） =============
+
+/// 判断 IPv4（host order）是否落在 FakeIP 网段内。
+pub fn is_fakeip(ip: u32) -> bool {
+    fakeip_lock().contains(ip)
+}
+
+/// FakeIP 反查域名（getnameinfo 用）；无映射返回 None。
+pub fn fakeip_domain_for(ip: u32) -> Option<String> {
+    fakeip_lock().lookup_domain(ip).map(str::to_string)
+}
+
+/// 为域名分配 FakeIP（gethostbyname 用）；返回 host order u32。
+pub fn fakeip_assign(domain: &str) -> Option<u32> {
+    fakeip_lock().assign(domain)
+}
+
 // ============= connect 就地代理 =============
 
 /// 平台 errno：网络不可达（促使 QUIC→TCP、WebRTC→TCP candidate 的标准降级信号）。
