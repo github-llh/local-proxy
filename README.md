@@ -21,6 +21,12 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 - **菜单栏形态**：托盘图标 + 弹出面板（状态、上游切换、出口 IP、流量、运行中应用）+ 完整设置窗口；
 - **桌面端配置**：Tauri v2 构建，Claude 风格界面，zh-CN / English。
 
+## 已知限制
+
+不开 TUN 的固有权衡：仅代理**从菜单栏启动**的应用；SIP 保护的系统二进制
+（`/usr/bin/*`）与启用 hardened runtime 的应用不可注入（launcher 会检测并
+提示替代方案）。详见 [docs/USAGE.md](docs/USAGE.md)。
+
 ## 架构
 
 ```
@@ -28,6 +34,8 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
    └── 本地代理核心 (Rust: SOCKS5/HTTP + 规则 + 上游级联 + 控制面)
            └── per-app 启动注入 (shim: macOS interpose dylib / Windows MinHook DLL)
 ```
+
+详见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
 ## 开发
 

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, pickAppFile, type AppConfig, type AppEntry, type RoutingRule, type UpstreamServer } from "../api";
+import { useT } from "../i18n";
 
 const emptyUpstream: UpstreamServer = {
   id: "",
@@ -26,6 +27,7 @@ const emptyRule: RoutingRule = {
 };
 
 export default function Settings() {
+  const t = useT();
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [apps, setApps] = useState<AppEntry[]>([]);
   const [saved, setSaved] = useState(false);
@@ -81,7 +83,7 @@ export default function Settings() {
   if (!config) {
     return (
       <main className="settings">
-        <p className="muted">{error ?? "加载中…"}</p>
+        <p className="muted">{error ?? t("settings.loading")}</p>
       </main>
     );
   }
@@ -92,11 +94,11 @@ export default function Settings() {
   return (
     <main className="settings">
       <header className="settings-header">
-        <h1>LocalProxy 设置</h1>
+        <h1>{t("settings.title")}</h1>
         <div className="header-actions">
-          {saved && <span className="badge ok">已保存</span>}
+          {saved && <span className="badge ok">{t("settings.saved")}</span>}
           <button className="btn btn-primary" onClick={handleSave}>
-            保存
+            {t("settings.save")}
           </button>
         </div>
       </header>
@@ -104,17 +106,17 @@ export default function Settings() {
       {error && <p className="error">{error}</p>}
 
       <section className="card">
-        <h2>监听</h2>
+        <h2>{t("settings.listen")}</h2>
         <div className="form-grid">
           <label>
-            监听地址
+            {t("settings.listenHost")}
             <input
               value={config.listen_host}
               onChange={(e) => patch((c) => (c.listen_host = e.target.value))}
             />
           </label>
           <label>
-            SOCKS5 端口
+            {t("settings.socks5Port")}
             <input
               type="number"
               value={config.socks5_port}
@@ -122,7 +124,7 @@ export default function Settings() {
             />
           </label>
           <label>
-            HTTP CONNECT 端口
+            {t("settings.httpPort")}
             <input
               type="number"
               value={config.http_port}
@@ -130,7 +132,7 @@ export default function Settings() {
             />
           </label>
           <label>
-            日志级别
+            {t("settings.logLevel")}
             <select
               value={config.log_level}
               onChange={(e) => patch((c) => (c.log_level = e.target.value))}
@@ -145,10 +147,10 @@ export default function Settings() {
       </section>
 
       <section className="card">
-        <h2>上游代理</h2>
+        <h2>{t("settings.upstream")}</h2>
         <div className="form-grid">
           <label>
-            激活上游
+            {t("settings.activeUpstream")}
             <select
               value={config.upstream.active}
               onChange={(e) => patch((c) => (c.upstream.active = e.target.value))}
@@ -164,7 +166,7 @@ export default function Settings() {
         {activeUpstream && (
           <div className="form-grid">
             <label>
-              名称
+              {t("settings.name")}
               <input
                 value={activeUpstream.name}
                 onChange={(e) =>
@@ -176,7 +178,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              类型
+              {t("settings.type")}
               <select
                 value={activeUpstream.type}
                 onChange={(e) =>
@@ -191,7 +193,7 @@ export default function Settings() {
               </select>
             </label>
             <label>
-              地址
+              {t("settings.host")}
               <input
                 value={activeUpstream.host}
                 onChange={(e) =>
@@ -203,7 +205,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              端口
+              {t("settings.port")}
               <input
                 type="number"
                 value={activeUpstream.port}
@@ -216,7 +218,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              用户名（可选）
+              {t("settings.username")}
               <input
                 value={activeUpstream.username}
                 onChange={(e) =>
@@ -228,7 +230,7 @@ export default function Settings() {
               />
             </label>
             <label>
-              密码（可选）
+              {t("settings.password")}
               <input
                 type="password"
                 value={activeUpstream.password}
@@ -253,7 +255,7 @@ export default function Settings() {
               })
             }
           >
-            + 添加上游
+            {t("settings.addUpstream")}
           </button>
           {config.upstream.servers.length > 1 && (
             <button
@@ -267,33 +269,33 @@ export default function Settings() {
                 })
               }
             >
-              删除当前上游
+              {t("settings.deleteUpstream")}
             </button>
           )}
         </div>
       </section>
 
       <section className="card">
-        <h2>路由规则</h2>
+        <h2>{t("settings.routing")}</h2>
         <div className="form-grid">
           <label>
-            默认动作
+            {t("settings.defaultAction")}
             <select
               value={config.routing.default_action}
               onChange={(e) => patch((c) => (c.routing.default_action = e.target.value))}
             >
-              <option value="proxy">proxy（默认走代理）</option>
-              <option value="direct">direct（默认直连）</option>
+              <option value="proxy">{t("settings.defaultActionProxy")}</option>
+              <option value="direct">{t("settings.defaultActionDirect")}</option>
             </select>
           </label>
           <label>
-            优先级模式
+            {t("settings.priorityMode")}
             <select
               value={config.routing.priority_mode}
               onChange={(e) => patch((c) => (c.routing.priority_mode = e.target.value))}
             >
-              <option value="order">order（数组序）</option>
-              <option value="number">number（priority 降序）</option>
+              <option value="order">{t("settings.priorityOrder")}</option>
+              <option value="number">{t("settings.priorityNumber")}</option>
             </select>
           </label>
         </div>
@@ -303,16 +305,16 @@ export default function Settings() {
             checked={config.routing.use_default_private}
             onChange={(e) => patch((c) => (c.routing.use_default_private = e.target.checked))}
           />
-          内网/回环地址自动直连（推荐）
+          {t("settings.autoPrivate")}
         </label>
         <table className="rules-table">
           <thead>
             <tr>
-              <th>启用</th>
-              <th>名称</th>
-              <th>动作</th>
-              <th>域名 / CIDR</th>
-              <th>端口</th>
+              <th>{t("settings.enabled")}</th>
+              <th>{t("settings.name")}</th>
+              <th>{t("settings.action")}</th>
+              <th>{t("settings.domains")}</th>
+              <th>{t("settings.port")}</th>
               <th></th>
             </tr>
           </thead>
@@ -387,25 +389,25 @@ export default function Settings() {
           className="btn btn-small"
           onClick={() => patch((c) => c.routing.rules.push({ ...emptyRule }))}
         >
-          + 添加规则
+          {t("settings.addRule")}
         </button>
       </section>
 
       <section className="card">
-        <h2>DNS 与 UDP</h2>
+        <h2>{t("settings.dnsUdp")}</h2>
         <div className="form-grid">
           <label>
-            DNS 模式
+            {t("settings.dnsMode")}
             <select
               value={config.dns_mode}
               onChange={(e) => patch((c) => (c.dns_mode = e.target.value))}
             >
-              <option value="proxy">proxy（交上游解析，防泄露）</option>
-              <option value="direct">direct（本地解析）</option>
+              <option value="proxy">{t("settings.dnsProxy")}</option>
+              <option value="direct">{t("settings.dnsDirect")}</option>
             </select>
           </label>
           <label>
-            UDP 模式
+            {t("settings.udpMode")}
             <select
               value={config.proxy_rules.udp_mode}
               onChange={(e) => patch((c) => (c.proxy_rules.udp_mode = e.target.value))}
@@ -417,17 +419,17 @@ export default function Settings() {
             </select>
           </label>
           <label>
-            UDP 失败降级
+            {t("settings.udpFallback")}
             <select
               value={config.proxy_rules.udp_fallback}
               onChange={(e) => patch((c) => (c.proxy_rules.udp_fallback = e.target.value))}
             >
-              <option value="block">block（失败即阻断）</option>
-              <option value="direct">direct（回退直连）</option>
+              <option value="block">{t("settings.udpFallbackBlock")}</option>
+              <option value="direct">{t("settings.udpFallbackDirect")}</option>
             </select>
           </label>
           <label>
-            IPv6
+            {t("settings.ipv6")}
             <select
               value={config.proxy_rules.ipv6_mode}
               onChange={(e) => patch((c) => (c.proxy_rules.ipv6_mode = e.target.value))}
@@ -438,7 +440,7 @@ export default function Settings() {
             </select>
           </label>
         </div>
-        <p className="muted">允许代理的端口（逗号分隔，留空 = 全部）</p>
+        <p className="muted">{t("settings.allowedPorts")}</p>
         <input
           value={config.proxy_rules.allowed_ports.join(", ")}
           onChange={(e) =>
@@ -453,10 +455,10 @@ export default function Settings() {
       </section>
 
       <section className="card">
-        <h2>应用</h2>
+        <h2>{t("settings.apps")}</h2>
         <div className="row-actions">
           <button className="btn btn-small" onClick={handleAddApp}>
-            + 添加应用
+            {t("settings.addApp")}
           </button>
         </div>
         <ul className="list">
@@ -470,14 +472,14 @@ export default function Settings() {
       </section>
 
       <section className="card">
-        <h2>高级</h2>
+        <h2>{t("settings.advanced")}</h2>
         <label className="checkbox">
           <input
             type="checkbox"
             checked={config.ui.launch_at_login}
             onChange={(e) => patch((c) => (c.ui.launch_at_login = e.target.checked))}
           />
-          开机自动启动（M3b 生效）
+          {t("settings.launchAtLogin")}
         </label>
         <label className="checkbox">
           <input
@@ -485,7 +487,7 @@ export default function Settings() {
             checked={config.ui.keep_core_alive}
             onChange={(e) => patch((c) => (c.ui.keep_core_alive = e.target.checked))}
           />
-          App 退出后核心继续常驻
+          {t("settings.keepCoreAlive")}
         </label>
         <label className="checkbox">
           <input
@@ -493,7 +495,7 @@ export default function Settings() {
             checked={config.ui.exit_ip_probe}
             onChange={(e) => patch((c) => (c.ui.exit_ip_probe = e.target.checked))}
           />
-          启用出口 IP 探测（popover 显示）
+          {t("settings.exitIpProbe")}
         </label>
       </section>
     </main>

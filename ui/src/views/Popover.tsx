@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, pickAppFile, type AppEntry, type CoreStatus, type SessionInfo } from "../api";
+import { useT } from "../i18n";
 
 function formatUptime(secs: number): string {
   if (secs < 60) return `${secs}s`;
@@ -10,6 +11,7 @@ function formatUptime(secs: number): string {
 }
 
 export default function Popover() {
+  const t = useT();
   const [status, setStatus] = useState<CoreStatus | null>(null);
   const [apps, setApps] = useState<AppEntry[]>([]);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -97,13 +99,13 @@ export default function Popover() {
     <main className="popover">
       <header className="popover-header">
         <span className={`status-dot ${status?.running ? "on" : "off"}`} />
-        <h1>LocalProxy</h1>
+        <h1>{t("app.name")}</h1>
         <button
           className={`btn ${status?.running ? "btn-danger" : "btn-primary"}`}
           onClick={handleToggleCore}
           disabled={busy}
         >
-          {status?.running ? "停止核心" : "启动核心"}
+          {status?.running ? t("popover.stopCore") : t("popover.startCore")}
         </button>
       </header>
 
@@ -111,31 +113,31 @@ export default function Popover() {
 
       <section className="card">
         <dl className="kv">
-          <dt>状态</dt>
+          <dt>{t("popover.status")}</dt>
           <dd>
             {status?.running
-              ? `运行中${status.pid ? ` (pid ${status.pid})` : ""} · ${formatUptime(status.uptime_secs)}`
-              : "未运行"}
+              ? `${t("popover.running")}${status.pid ? ` (pid ${status.pid})` : ""} · ${formatUptime(status.uptime_secs)}`
+              : t("popover.notRunning")}
           </dd>
-          <dt>当前上游</dt>
+          <dt>{t("popover.upstream")}</dt>
           <dd>
-            {status?.active_upstream || "未配置"}
+            {status?.active_upstream || t("popover.notConfigured")}
             {status?.upstream_type ? ` (${status.upstream_type})` : ""}
           </dd>
-          <dt>SOCKS5</dt>
+          <dt>{t("popover.socks5")}</dt>
           <dd>127.0.0.1:{status?.socks5_port ?? "-"}</dd>
-          <dt>HTTP</dt>
+          <dt>{t("popover.http")}</dt>
           <dd>127.0.0.1:{status?.http_port ?? "-"}</dd>
         </dl>
       </section>
 
       <section className="section">
         <div className="section-head">
-          <h2>运行中</h2>
+          <h2>{t("popover.runningApps")}</h2>
           <span className="muted">{sessions.length}</span>
         </div>
         {sessions.length === 0 ? (
-          <p className="muted">暂无运行中的被代理应用</p>
+          <p className="muted">{t("popover.noRunningApps")}</p>
         ) : (
           <ul className="list">
             {sessions.map((s) => (
@@ -143,7 +145,7 @@ export default function Popover() {
                 <span className="item-name">{s.entry_name}</span>
                 <span className="muted">pid {s.pid}</span>
                 <button className="btn btn-small" onClick={() => handleStop(s.entry_id)}>
-                  停止
+                  {t("popover.stop")}
                 </button>
               </li>
             ))}
@@ -153,13 +155,13 @@ export default function Popover() {
 
       <section className="section">
         <div className="section-head">
-          <h2>应用</h2>
+          <h2>{t("popover.apps")}</h2>
           <button className="btn btn-small" onClick={handleAddApp}>
-            + 添加
+            {t("popover.add")}
           </button>
         </div>
         {apps.length === 0 ? (
-          <p className="muted">尚未登记应用。添加后即可从代理模式启动。</p>
+          <p className="muted">{t("popover.noApps")}</p>
         ) : (
           <ul className="list">
             {apps.map((app) => (
@@ -168,20 +170,20 @@ export default function Popover() {
                   {app.name}
                 </span>
                 {runningIds.has(app.id) ? (
-                  <span className="badge">运行中</span>
+                  <span className="badge">{t("popover.running")}</span>
                 ) : (
                   <button
                     className="btn btn-small btn-primary"
                     onClick={() => handleLaunch(app.id)}
                     disabled={busy}
                   >
-                    代理启动
+                    {t("popover.launch")}
                   </button>
                 )}
                 <button
                   className="btn btn-small btn-ghost"
                   onClick={() => handleRemove(app.id)}
-                  title="移除登记"
+                  title="remove"
                 >
                   ×
                 </button>
@@ -192,7 +194,7 @@ export default function Popover() {
       </section>
 
       <footer className="popover-footer">
-        <span className="muted">菜单栏图标右键 → 设置</span>
+        <span className="muted">{t("popover.footerHint")}</span>
       </footer>
     </main>
   );
