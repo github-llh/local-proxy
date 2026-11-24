@@ -148,11 +148,64 @@ static int nonblock_probe(const char *host, const char *port) {
     return 0;
 }
 
+
+/// UDP 代理探测：sendto + recvfrom roundtrip（S2 全代理验证）。
+static int udp_proxy_probe(const char *host, const char *port) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host, port, &hints, &res);
+    if (gai != 0 || res == NULL) {
+        fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(gai));
+        return 1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        perror("socket");
+        freeaddrinfo(res);
+        return 1;
+    }
+
+    const char *payload = "LP-UDP-PROXY-PROBE";
+    ssize_t n = sendto(fd, payload, strlen(payload), 0, res->ai_addr, res->ai_addrlen);
+    if (n < 0) {
+        printf("UDP_PROXY_SEND_FAILED errno=%d (%s)\n", errno, strerror(errno));
+        close(fd);
+        freeaddrinfo(res);
+        return 1;
+    }
+    printf("UDP_PROXY_SEND_OK bytes=%zd\n", n);
+
+    // 收响应（roundtrip）
+    struct sockaddr_storage from;
+    socklen_t fromlen = sizeof(from);
+    char buf[4096];
+    ssize_t r = recvfrom(fd, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &fromlen);
+    if (r > 0) {
+        buf[r] = '\0';
+        printf("UDP_PROXY_RECV data=%s\n", buf);
+    } else {
+        printf("UDP_PROXY_RECV_FAILED errno=%d (%s)\n", errno, strerror(errno));
+    }
+    close(fd);
+    freeaddrinfo(res);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--udp") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";
         const char *port = argc > 3 ? argv[3] : "3478";
         return udp_probe(host, port);
+    }
+    if (argc >= 2 && strcmp(argv[1], "--udp-proxy") == 0) {
+        const char *host = argc > 2 ? argv[2] : "example.com";
+        const char *port = argc > 3 ? argv[3] : "3478";
+        return udp_proxy_probe(host, port);
     }
     if (argc >= 2 && strcmp(argv[1], "--nonblock") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";

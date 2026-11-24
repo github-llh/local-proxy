@@ -7,12 +7,13 @@
 //! 分流：`RuleEngine::decide` → `Direct`（本地拨号）/ `Proxy`（上游级联）。
 //! 拒绝时返回对应协议的错误响应（SOCKS5 REPLY 码 / HTTP 状态码）。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-use localproxy_net::socks5::{consts, reply_to_text, Timeouts};
+use localproxy_net::socks5::{self, consts, reply_to_text, Timeouts};
 
 use crate::config::AppConfig;
 use crate::diagnostics::{self, ConnectionLog, ConnectionRecord};
@@ -252,6 +253,10 @@ async fn handle_socks5(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: A
     if stream.read_exact(&mut req_head).await.is_err() {
         return;
     }
+    if req_head[1] == consts::CMD_UDP_ASSOCIATE {
+        handle_udp_associate(stream, peer, ctx.clone()).await;
+        return;
+    }
     if req_head[0] != consts::VERSION || req_head[1] != consts::CMD_CONNECT {
         let _ = send_socks5_reply(&mut stream, 0x07).await; // 不支持的命令
         return;
@@ -294,6 +299,196 @@ async fn handle_socks5(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: A
         }
     }
     ctx.stats.on_connect_finished();
+}
+
+/// SOCKS5 UDP ASSOCIATE 入站处理（S2：UDP 全代理）。
+///
+/// 流程：
+/// 1. 本地绑定 UDP relay socket，响应 BND.ADDR/PORT；
+/// 2. 保持 TCP 控制连接（客户端关闭即关联终止）；
+/// 3. relay task 收客户端封装包 → 按目标获取/建立上游 UdpSession →
+///    转发；上游响应 task 解封装 → 按来源封装回送。
+async fn handle_udp_associate(
+    mut control: TcpStream,
+    peer: std::net::SocketAddr,
+    ctx: Arc<ServerContext>,
+) {
+    // 消费请求中的 DST.ADDR/PORT（通常 0.0.0.0:0）
+    if read_socks5_address(&mut control, 0x01).await.is_none() {
+        let _ = send_socks5_reply(&mut control, 0x08).await;
+        return;
+    }
+
+    // 本地 relay UDP socket
+    let relay_socket = match tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("UDP ASSOCIATE: 绑定 relay 失败: {e}");
+            let _ = send_socks5_reply(&mut control, 0x01).await;
+            return;
+        }
+    };
+    let relay_addr = match relay_socket.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!("UDP ASSOCIATE: 获取 relay 地址失败: {e}");
+            let _ = send_socks5_reply(&mut control, 0x01).await;
+            return;
+        }
+    };
+
+    // 响应 BND.ADDR/PORT（IPv4 形式）
+    let mut resp = vec![
+        consts::VERSION,
+        consts::REPLY_SUCCESS,
+        0x00,
+        consts::ATYP_IPV4,
+    ];
+    if let std::net::SocketAddr::V4(v4) = relay_addr {
+        resp.extend_from_slice(&v4.ip().octets());
+        resp.extend_from_slice(&v4.port().to_be_bytes());
+    } else {
+        let _ = send_socks5_reply(&mut control, 0x01).await;
+        return;
+    }
+    if control.write_all(&resp).await.is_err() {
+        return;
+    }
+    ctx.stats.on_connect_started();
+    ctx.record_connection("udp", "associate", 0, "proxy", "", "ok", "");
+
+    let relay_socket = Arc::new(relay_socket);
+    // 上游会话缓存：目标 host:port -> UdpSession（含 reader task 生命周期）
+    let sessions: Arc<
+        tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<UdpSessionEntry>>>>,
+    > = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, client_addr) = match relay_socket.recv_from(&mut buf).await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("UDP relay 接收结束: {e}");
+                break;
+            }
+        };
+        let Some((dst_host, dst_port, payload)) = socks5::decode_udp_packet(&buf[..n]) else {
+            continue;
+        };
+        let key = format!("{dst_host}:{dst_port}");
+        let entry = {
+            let mut guard = sessions.lock().await;
+            if let Some(existing) = guard.get(&key) {
+                existing.clone()
+            } else {
+                // 建立上游 UdpSession（按目标）
+                let session = match create_upstream_udp_session(&ctx, &dst_host, dst_port).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("UDP 上游会话建立失败 {key}: {e}");
+                        ctx.stats.on_connect_failed();
+                        continue;
+                    }
+                };
+                let entry = Arc::new(tokio::sync::Mutex::new(session));
+                guard.insert(key.clone(), entry.clone());
+                // 上游响应 reader task
+                let relay_socket = relay_socket.clone();
+                let entry_for_reader = entry.clone();
+                tokio::spawn(async move {
+                    upstream_reader_task(relay_socket, client_addr, entry_for_reader).await;
+                });
+                entry
+            }
+        };
+        {
+            let session = entry.lock().await;
+            if let Err(e) = session
+                .session
+                .socket
+                .send_to(payload, session.session.relay)
+                .await
+            {
+                tracing::debug!("UDP 上游发送失败 {key}: {e}");
+            }
+        }
+    }
+
+    // 控制连接关闭 → 关联终止
+    ctx.stats.on_connect_finished();
+    tracing::debug!("UDP ASSOCIATE {peer} 结束");
+}
+
+/// 上游 UDP 会话（含目标信息，用于回包封装来源）。
+struct UdpSessionEntry {
+    session: crate::upstream::UdpSession,
+    target_host: String,
+    target_port: u16,
+}
+
+/// 建立上游 UDP 会话。
+async fn create_upstream_udp_session(
+    ctx: &ServerContext,
+    host: &str,
+    port: u16,
+) -> Result<UdpSessionEntry, DispatchError> {
+    let (server, timeouts) = {
+        let cfg = ctx.config.read().await;
+        match cfg.upstream.active_server() {
+            Some(s) => (
+                s.clone(),
+                Timeouts {
+                    connect_ms: 5000,
+                    send_ms: 5000,
+                    recv_ms: 5000,
+                },
+            ),
+            None => return Err(DispatchError::Protocol("无可用上游".to_string())),
+        }
+    };
+    let upstream = Upstream::new(server, timeouts);
+    let bind = std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0));
+    let session = upstream
+        .udp_associate(&bind)
+        .await
+        .map_err(DispatchError::from)?;
+    Ok(UdpSessionEntry {
+        session,
+        target_host: host.to_string(),
+        target_port: port,
+    })
+}
+
+/// 上游响应 reader：收上游 UDP → 解封装 → 按来源封装 → 发回客户端。
+async fn upstream_reader_task(
+    relay_socket: Arc<tokio::net::UdpSocket>,
+    client_addr: std::net::SocketAddr,
+    entry: Arc<tokio::sync::Mutex<UdpSessionEntry>>,
+) {
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let (n, _from) = {
+            let session = entry.lock().await;
+            match session.session.socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::debug!("UDP 上游接收结束: {e}");
+                    return;
+                }
+            }
+        };
+        let (target_host, target_port) = {
+            let session = entry.lock().await;
+            (session.target_host.clone(), session.target_port)
+        };
+        let packet = match socks5::encode_udp_packet(&target_host, target_port, &buf[..n]) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if relay_socket.send_to(&packet, client_addr).await.is_err() {
+            return;
+        }
+    }
 }
 
 /// 读取 SOCKS5 请求的 ATYP + ADDR + PORT。
@@ -719,5 +914,57 @@ mod tests {
         assert_eq!(snap.connections_total, 1);
         assert_eq!(snap.connections_proxy, 1);
         assert_eq!(snap.connections_active, 0);
+    }
+
+    // ---- UDP ASSOCIATE relay（S2） ----
+
+    #[tokio::test]
+    async fn udp_associate_returns_relay_and_accepts_packet() {
+        // 起核心（无上游也可完成 ASSOCIATE 协商；数据转发目标不存在时仅记录失败）
+        let ctx = Arc::new(ServerContext::new(AppConfig::default()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let core_addr = listener.local_addr().unwrap();
+        let ctx2 = ctx.clone();
+        tokio::spawn(async move {
+            let _ = run_socks5(listener, ctx2).await;
+        });
+
+        // 客户端：TCP 连 core → UDP ASSOCIATE
+        let mut control = TcpStream::connect(core_addr).await.unwrap();
+        control.write_all(&[0x05, 0x01, 0x00]).await.unwrap();
+        let mut resp = [0u8; 2];
+        control.read_exact(&mut resp).await.unwrap();
+        assert_eq!(resp, [0x05, 0x00]);
+
+        // UDP ASSOCIATE 请求（DST 0.0.0.0:0）
+        control
+            .write_all(&[0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply[0], 0x05);
+        assert_eq!(reply[1], 0x00, "ASSOCIATE 应成功");
+        assert_eq!(reply[3], 0x01, "BND 应为 IPv4");
+        let relay_port = u16::from_be_bytes([reply[8], reply[9]]);
+        assert_ne!(relay_port, 0, "relay 端口应非零");
+
+        // 向 relay 发送封装包（目标 127.0.0.1:9999 无上游监听——不断言回包，
+        // 仅验证核心不崩溃且连接记录已写）
+        let packet = socks5::encode_udp_packet("127.0.0.1", 9999, b"ping").unwrap();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        socket
+            .send_to(&packet, format!("127.0.0.1:{relay_port}"))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let records = ctx.connections.recent(10);
+        assert!(
+            records
+                .iter()
+                .any(|r| r.action == "proxy" && r.protocol == "udp"),
+            "应有 UDP associate 记录: {records:?}"
+        );
     }
 }

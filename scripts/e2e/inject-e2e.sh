@@ -138,5 +138,18 @@ grep -q "MOCK-UPSTREAM-OK" /tmp/lp-e2e-nb.txt \
   && echo "PASS: 非阻塞 connect 经注入正常工作（shim O_NONBLOCK 适配生效）" \
   || { echo "FAIL: 非阻塞 connect 回归"; cat /tmp/lp-e2e-nb.txt; exit 1; }
 
+echo "== 11. UDP 全代理断言（udp_mode=proxy，S2 roundtrip） =="
+# mock 上游需支持 UDP Associate：mock_upstream.py 的 UDP echo 即中继目标
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  LP_UDP_MODE=proxy /tmp/lp-e2e-client --udp-proxy 127.0.0.1 $MOCK_UDP_PORT > /tmp/lp-e2e-udpproxy.txt 2>/dev/null || true
+grep -q "UDP_PROXY_SEND_OK" /tmp/lp-e2e-udpproxy.txt \
+  && grep -q "UDP_PROXY_RECV data=LP-UDP-PROXY-PROBE" /tmp/lp-e2e-udpproxy.txt \
+  && echo "PASS: UDP 全代理 roundtrip 经核心到达 mock（sendto/recvfrom + ASSOCIATE 链路）" \
+  || { echo "FAIL: UDP 全代理 roundtrip 异常"; cat /tmp/lp-e2e-udpproxy.txt; exit 1; }
+# mock 侧确认收到该 UDP 包（经核心中继）
+grep -q "LP-UDP-PROXY-PROBE" "$UDP_SEEN_FILE" \
+  && echo "PASS: mock UDP 收到经核心中继的探测包" \
+  || { echo "FAIL: mock 未收到中继包"; cat "$UDP_SEEN_FILE" 2>/dev/null; exit 1; }
+
 echo ""
 echo "===== M2 端到端验证全部通过 ====="

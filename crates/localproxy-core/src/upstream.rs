@@ -9,6 +9,7 @@
 //! - HTTP CONNECT 上游（含 Basic 认证）
 //! - 连接/发送/接收分级超时（移植旧 `Timeouts` 语义）
 
+use std::net::ToSocketAddrs;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +50,124 @@ impl std::fmt::Display for UpstreamError {
 }
 
 impl std::error::Error for UpstreamError {}
+
+/// UDP Associate 会话：控制 TCP（保持存活）+ 本地 UDP socket + 上游 relay 地址。
+pub struct UdpSession {
+    /// SOCKS5 控制连接（必须保持存活，关闭即关联终止）
+    pub control: TcpStream,
+    /// 本地 UDP socket（已绑定）
+    pub socket: tokio::net::UdpSocket,
+    /// 上游 relay 地址（UDP 包发往此处）
+    pub relay: std::net::SocketAddr,
+}
+
+impl Upstream {
+    /// SOCKS5 UDP ASSOCIATE（异步）。
+    ///
+    /// 仅 SOCKS5 上游支持；HTTP 上游返回错误（调用方按 `udp_fallback` 处理）。
+    pub async fn udp_associate(
+        &self,
+        bind: &std::net::SocketAddr,
+    ) -> Result<UdpSession, UpstreamError> {
+        if self.server.server_type != "socks5" {
+            return Err(UpstreamError::Protocol(format!(
+                "上游类型 {} 不支持 UDP Associate",
+                self.server.server_type
+            )));
+        }
+        let mut control = tokio::time::timeout(
+            self.timeouts.connect_timeout(),
+            TcpStream::connect(self.server.endpoint()),
+        )
+        .await
+        .map_err(|_| UpstreamError::Io("连接上游超时".to_string()))?
+        .map_err(|e| UpstreamError::Io(format!("连接上游失败: {e}")))?;
+        control
+            .set_nodelay(true)
+            .map_err(|e| UpstreamError::Io(e.to_string()))?;
+
+        let auth = ProxyAuth {
+            username: self.server.username.clone(),
+            password: self.server.password.clone(),
+        };
+        // 方法协商
+        let greeting = socks5::build_greeting(&auth);
+        write_timeout(&mut control, &greeting, self.timeouts.send_timeout()).await?;
+        let mut method_resp = [0u8; 2];
+        read_exact_timeout(&mut control, &mut method_resp, self.timeouts.recv_timeout()).await?;
+        socks5::parse_method_response(&method_resp).map_err(UpstreamError::from)?;
+
+        // UDP ASSOCIATE 请求（DST 0.0.0.0:0）
+        let mut request = Vec::with_capacity(10);
+        request.push(consts::VERSION);
+        request.push(consts::CMD_UDP_ASSOCIATE);
+        request.push(0x00);
+        request.push(consts::ATYP_IPV4);
+        request.extend_from_slice(&[0, 0, 0, 0]);
+        request.extend_from_slice(&[0, 0]);
+        write_timeout(&mut control, &request, self.timeouts.send_timeout()).await?;
+
+        // 响应
+        let mut header = [0u8; 4];
+        read_exact_timeout(&mut control, &mut header, self.timeouts.recv_timeout()).await?;
+        let reply = socks5::parse_reply_header(&header).map_err(UpstreamError::from)?;
+        if reply.rep != consts::REPLY_SUCCESS {
+            return Err(UpstreamError::Reply(reply.rep));
+        }
+        let domain_len = if reply.atyp == consts::ATYP_DOMAIN {
+            let mut len_byte = [0u8; 1];
+            read_exact_timeout(&mut control, &mut len_byte, self.timeouts.recv_timeout()).await?;
+            Some(len_byte[0])
+        } else {
+            None
+        };
+        let tail = socks5::reply_tail_len(reply.atyp, domain_len)
+            .ok_or_else(|| UpstreamError::Protocol("响应 ATYP 未知".to_string()))?;
+        let mut tail_buf = vec![0u8; tail];
+        read_exact_timeout(&mut control, &mut tail_buf, self.timeouts.recv_timeout()).await?;
+
+        // 解析 relay 地址
+        let relay = match reply.atyp {
+            consts::ATYP_IPV4 => std::net::SocketAddr::from((
+                std::net::Ipv4Addr::new(tail_buf[0], tail_buf[1], tail_buf[2], tail_buf[3]),
+                u16::from_be_bytes([tail_buf[4], tail_buf[5]]),
+            )),
+            consts::ATYP_IPV6 => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(&tail_buf[..16]);
+                std::net::SocketAddr::from((
+                    std::net::Ipv6Addr::from(octets),
+                    u16::from_be_bytes([tail_buf[16], tail_buf[17]]),
+                ))
+            }
+            consts::ATYP_DOMAIN => {
+                let name = String::from_utf8_lossy(&tail_buf[..domain_len.unwrap_or(0) as usize])
+                    .to_string();
+                let port_off = domain_len.unwrap_or(0) as usize;
+                let port = u16::from_be_bytes([tail_buf[port_off], tail_buf[port_off + 1]]);
+                name.to_socket_addrs()
+                    .map_err(|e| UpstreamError::Protocol(format!("BND 域名解析失败: {e}")))?
+                    .next()
+                    .map(|mut a| {
+                        a.set_port(port);
+                        a
+                    })
+                    .ok_or_else(|| UpstreamError::Protocol("BND 域名无地址".to_string()))?
+            }
+            other => return Err(UpstreamError::Protocol(format!("ATYP 未知: {other}"))),
+        };
+
+        let socket = tokio::net::UdpSocket::bind(bind)
+            .await
+            .map_err(|e| UpstreamError::Io(format!("绑定 UDP 失败: {e}")))?;
+
+        Ok(UdpSession {
+            control,
+            socket,
+            relay,
+        })
+    }
+}
 
 impl From<socks5::Socks5Error> for UpstreamError {
     fn from(e: socks5::Socks5Error) -> Self {

@@ -26,6 +26,7 @@ use std::os::raw::{c_char, c_int, c_void};
 
 use localproxy_shim::config::ShimConfig;
 use localproxy_shim::engine;
+use localproxy_shim::engine::SockIo;
 
 // ============= 原始函数声明 =============
 
@@ -46,6 +47,15 @@ extern "C" {
         tolen: libc::socklen_t,
     ) -> isize;
     fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize;
+    fn recvfrom(
+        fd: c_int,
+        buf: *mut c_void,
+        len: usize,
+        flags: c_int,
+        from: *mut libc::sockaddr,
+        fromlen: *mut libc::socklen_t,
+    ) -> isize;
+    fn close(fd: c_int) -> c_int;
     fn gethostbyname(name: *const c_char) -> *mut libc::hostent;
     fn gethostbyname2(name: *const c_char, af: c_int) -> *mut libc::hostent;
     fn getnameinfo(
@@ -166,6 +176,16 @@ impl engine::SockIo for MacOsIo {
         // 核心地址必须是 IP 字面量（域名会经 getaddrinfo hook 拿到 FakeIP，形成环）
         engine::config().core_endpoint().parse().ok()
     }
+
+    fn raw_socket(&self) -> i64 {
+        // SAFETY: libc socket 无内存安全前提
+        (unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) }) as i64
+    }
+
+    fn raw_close(&self, fd: i64) {
+        // SAFETY: fd 由 raw_socket 创建
+        unsafe { libc::close(fd as i32) };
+    }
 }
 
 static IO: MacOsIo = MacOsIo;
@@ -275,8 +295,40 @@ pub extern "C" fn localproxy_sendto(
             -1
         }
         engine::UdpOutcome::Proxy => {
-            unsafe { set_errno(engine::ERR_NET_UNREACH) };
-            -1
+            // S2 全代理：ASSOCIATE + 封装目标 + 经 relay 发送
+            let Some((local_fd, relay)) = udp_session_get_or_create(fd) else {
+                // SAFETY: errno 设置
+                unsafe { set_errno(libc::ECONNREFUSED) };
+                return -1;
+            };
+            let host = udp_target_host(&target);
+            let port = target.port();
+            // SAFETY: msg/len 由调用方保证
+            let payload = unsafe { std::slice::from_raw_parts(msg as *const u8, len) };
+            let packet = match localproxy_net::socks5::encode_udp_packet(&host, port, payload) {
+                Ok(p) => p,
+                Err(_) => {
+                    // SAFETY: errno 设置
+                    unsafe { set_errno(libc::EINVAL) };
+                    return -1;
+                }
+            };
+            // SAFETY: relay 为有效 sockaddr_in；local_fd 为已绑定 UDP socket
+            let n = unsafe {
+                sendto(
+                    local_fd,
+                    packet.as_ptr() as *const c_void,
+                    packet.len(),
+                    0,
+                    &relay as *const _ as *const libc::sockaddr,
+                    std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                )
+            };
+            if n < 0 {
+                return -1;
+            }
+            // 对应用户数据长度（不含 SOCKS5 封装头）
+            len as isize
         }
     }
 }
@@ -317,6 +369,203 @@ pub extern "C" fn localproxy_sendmsg(fd: RawFd, msg: *const libc::msghdr, flags:
             -1
         }
     }
+}
+
+// ============= UDP 代理会话（S2） =============
+
+/// 一个 UDP 代理会话：控制连接 + 本地 UDP socket + 核心 relay 地址。
+struct UdpSession {
+    control_fd: c_int,
+    local_fd: c_int,
+    relay: libc::sockaddr_in,
+}
+
+/// 应用 fd → UDP 会话。
+static UDP_SESSIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<c_int, UdpSession>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// 查询或建立 UDP 会话（按应用 fd）。
+///
+/// 首次 sendto 时触发：向核心 UDP ASSOCIATE → 本地 UDP socket → 记录。
+/// 返回 `(本地 socket fd, relay sockaddr)`；调用方**不得**跨调用持有引用
+/// （会话只可在持锁期间使用；本函数复制出值返回，避免悬垂引用）。
+// 允许 contains_key + insert 两步模式：建联失败时不能留下半初始化条目
+#[allow(clippy::map_entry)]
+fn udp_session_get_or_create(app_fd: c_int) -> Option<(c_int, libc::sockaddr_in)> {
+    let mut sessions = UDP_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if !sessions.contains_key(&app_fd) {
+        let (control_fd, relay_addr) = match engine::core_udp_associate(&IO) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("shim: UDP ASSOCIATE 失败: {e}");
+                return None;
+            }
+        };
+        // 本地 UDP socket（随机端口）
+        // SAFETY: libc socket
+        let local_fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if local_fd < 0 {
+            IO.raw_close(control_fd);
+            return None;
+        }
+        // 绑定 127.0.0.1:0
+        let mut local_addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        local_addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        local_addr.sin_port = 0u16.to_be();
+        local_addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        // SAFETY: local_addr 为有效 sockaddr_in
+        let rc = unsafe {
+            libc::bind(
+                local_fd,
+                &local_addr as *const _ as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            // SAFETY: local_fd 有效
+            unsafe { libc::close(local_fd) };
+            IO.raw_close(control_fd);
+            return None;
+        }
+
+        // relay sockaddr（IPv4）
+        let mut relay: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        relay.sin_family = libc::AF_INET as libc::sa_family_t;
+        if let std::net::SocketAddr::V4(v4) = relay_addr {
+            relay.sin_port = v4.port().to_be();
+            relay.sin_addr.s_addr = u32::from(*v4.ip()).to_be();
+        }
+
+        sessions.insert(
+            app_fd,
+            UdpSession {
+                control_fd: control_fd as c_int,
+                local_fd,
+                relay,
+            },
+        );
+        tracing::debug!("shim: UDP 会话建立 fd={app_fd} relay={relay_addr}");
+    }
+    // 复制值返回（不返回引用，避免锁外悬垂）
+    let session = sessions.get(&app_fd)?;
+    Some((session.local_fd, session.relay))
+}
+
+/// 移除 UDP 会话（close 时）。
+fn udp_session_remove(app_fd: c_int) {
+    let mut sessions = UDP_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(session) = sessions.remove(&app_fd) {
+        // SAFETY: fd 归本会话所有
+        unsafe {
+            libc::close(session.local_fd);
+            libc::close(session.control_fd);
+        }
+        tracing::debug!("shim: UDP 会话移除 fd={app_fd}");
+    }
+}
+
+/// 从目标地址还原（域名, 端口）：FakeIP → 映射域名；IP 字面量 → IP 字符串。
+fn udp_target_host(target: &SocketAddr) -> String {
+    match target {
+        SocketAddr::V4(v4) => {
+            let ip = *v4.ip();
+            match engine::fakeip_lock().lookup_domain(u32::from(ip)) {
+                Some(domain) => domain.to_string(),
+                None => ip.to_string(),
+            }
+        }
+        SocketAddr::V6(v6) => v6.ip().to_string(),
+    }
+}
+
+// ============= hook: recvfrom / close（UDP 会话） =============
+
+/// `recvfrom` 替换实现：有 UDP 会话时从本地 relay socket 收并解封装。
+#[no_mangle]
+pub extern "C" fn localproxy_recvfrom(
+    fd: RawFd,
+    buf: *mut c_void,
+    len: usize,
+    flags: c_int,
+    from: *mut libc::sockaddr,
+    fromlen: *mut libc::socklen_t,
+) -> isize {
+    if !engine::is_installed() {
+        return unsafe { recvfrom(fd, buf, len, flags, from, fromlen) };
+    }
+
+    // 无会话 → 原函数
+    let has_session = {
+        let sessions = UDP_SESSIONS.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.contains_key(&fd)
+    };
+    if !has_session {
+        return unsafe { recvfrom(fd, buf, len, flags, from, fromlen) };
+    }
+
+    let Some((local_fd, _relay)) = udp_session_get_or_create(fd) else {
+        return unsafe { recvfrom(fd, buf, len, flags, from, fromlen) };
+    };
+
+    // 从本地 relay socket 收（透传应用的阻塞/非阻塞语义由 socket 自身决定）
+    let mut packet = vec![0u8; 65536];
+    // SAFETY: local_fd 为已绑定 UDP socket；packet 可写
+    let n = unsafe {
+        recvfrom(
+            local_fd,
+            packet.as_mut_ptr() as *mut c_void,
+            packet.len(),
+            0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if n <= 0 {
+        return n;
+    }
+    let Some((src_host, src_port, payload)) =
+        localproxy_net::socks5::decode_udp_packet(&packet[..n as usize])
+    else {
+        // SAFETY: errno 设置
+        unsafe { set_errno(libc::EAGAIN) };
+        return -1;
+    };
+
+    // 回填数据（截断到调用方缓冲区）
+    let copy_len = payload.len().min(len);
+    // SAFETY: buf 可写 len 字节；payload 可读 copy_len 字节
+    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), buf as *mut u8, copy_len) };
+
+    // 回填源地址（IPv4 sockaddr_in）
+    if !from.is_null() && !fromlen.is_null() {
+        let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_port = src_port.to_be();
+        if let Ok(ip) = src_host.parse::<std::net::Ipv4Addr>() {
+            addr.sin_addr.s_addr = u32::from(ip).to_be();
+        }
+        // SAFETY: from 缓冲区容量由 fromlen 给出
+        unsafe {
+            let cap = *fromlen as usize;
+            let write = std::mem::size_of::<libc::sockaddr_in>().min(cap);
+            std::ptr::copy_nonoverlapping(&addr as *const _ as *const u8, from as *mut u8, write);
+            *fromlen = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+        }
+    }
+    copy_len as isize
+}
+
+/// `close` 替换实现：清理 UDP 会话。
+///
+/// 注意：`close` 会被 stdio/malloc 在极早期调用，此处**绝不能**触发
+/// 引擎安装（其堆分配会在 malloc 重入上下文中损坏堆）；只做无分配的就绪检查。
+#[no_mangle]
+pub extern "C" fn localproxy_close(fd: RawFd) -> c_int {
+    if engine::is_installed() {
+        udp_session_remove(fd);
+    }
+    unsafe { close(fd) }
 }
 
 // ============= hook: getaddrinfo =============
@@ -620,6 +869,20 @@ static INTERPOSE_SENDTO: InterposePair = InterposePair {
 static INTERPOSE_SENDMSG: InterposePair = InterposePair {
     replacement: localproxy_sendmsg as *const c_void,
     original: sendmsg as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_RECVFROM: InterposePair = InterposePair {
+    replacement: localproxy_recvfrom as *const c_void,
+    original: recvfrom as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_CLOSE: InterposePair = InterposePair {
+    replacement: localproxy_close as *const c_void,
+    original: close as *const c_void,
 };
 
 #[link_section = "__DATA,__interpose"]

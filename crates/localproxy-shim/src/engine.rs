@@ -59,6 +59,12 @@ pub trait SockIo: Send + Sync + 'static {
 
     /// 本地核心的 socket 地址（由配置的 host:port 解析）。
     fn core_addr(&self) -> Option<SocketAddr>;
+
+    /// 创建 TCP socket（UDP Associate 的控制连接用）；失败返回负值。
+    fn raw_socket(&self) -> i64;
+
+    /// 关闭 fd。
+    fn raw_close(&self, fd: i64);
 }
 
 /// 安装引擎（幂等）。返回 false 表示已安装或配置非法。
@@ -339,6 +345,126 @@ pub fn proxy_connect(io: &dyn SockIo, fd: i64, target: &SocketAddr) -> std::io::
     }
 }
 
+/// 向本地核心发起 SOCKS5 UDP ASSOCIATE（S2）。
+///
+/// 返回 `(控制连接 fd, 中继地址)`；控制连接必须保持存活
+/// （关闭即关联终止），由调用方持有并在会话结束时 `raw_close`。
+pub fn core_udp_associate(io: &dyn SockIo) -> std::io::Result<(i64, SocketAddr)> {
+    let cfg = config();
+    let core = io.core_addr().ok_or_else(|| {
+        std::io::Error::other(format!("核心地址解析失败: {}", cfg.core_endpoint()))
+    })?;
+
+    let fd = io.raw_socket();
+    if fd < 0 {
+        return Err(std::io::Error::other("创建 socket 失败"));
+    }
+    let (addr_bytes, addr_len) = encode_sockaddr(&core);
+    // SAFETY: addr_bytes 构成有效 sockaddr
+    let rc = unsafe { io.raw_connect(fd, addr_bytes.as_ptr(), addr_len) };
+    if rc != 0 {
+        io.raw_close(fd);
+        return Err(std::io::Error::other("连接本地核心失败"));
+    }
+
+    let auth = ProxyAuth::default();
+    let timeouts = Timeouts::default();
+
+    // 方法协商
+    let greeting = socks5::build_greeting(&auth);
+    if let Err(e) = write_all(io, fd, &greeting, timeouts) {
+        io.raw_close(fd);
+        return Err(e);
+    }
+    let mut method_resp = [0u8; 2];
+    if let Err(e) = read_exact(io, fd, &mut method_resp, timeouts) {
+        io.raw_close(fd);
+        return Err(e);
+    }
+    if let Err(e) = socks5::parse_method_response(&method_resp) {
+        io.raw_close(fd);
+        return Err(std::io::Error::other(e.to_string()));
+    }
+
+    // UDP ASSOCIATE 请求（DST 0.0.0.0:0）
+    let mut request = Vec::with_capacity(10);
+    request.push(consts::VERSION);
+    request.push(consts::CMD_UDP_ASSOCIATE);
+    request.push(0x00);
+    request.push(consts::ATYP_IPV4);
+    request.extend_from_slice(&[0, 0, 0, 0]);
+    request.extend_from_slice(&[0, 0]);
+    if let Err(e) = write_all(io, fd, &request, timeouts) {
+        io.raw_close(fd);
+        return Err(e);
+    }
+
+    // 响应
+    let mut header = [0u8; 4];
+    if let Err(e) = read_exact(io, fd, &mut header, timeouts) {
+        io.raw_close(fd);
+        return Err(e);
+    }
+    let reply = match socks5::parse_reply_header(&header) {
+        Ok(r) => r,
+        Err(e) => {
+            io.raw_close(fd);
+            return Err(std::io::Error::other(e.to_string()));
+        }
+    };
+    if reply.rep != consts::REPLY_SUCCESS {
+        io.raw_close(fd);
+        return Err(std::io::Error::other(format!(
+            "核心拒绝 UDP ASSOCIATE (REP={}, {})",
+            reply.rep,
+            socks5::reply_to_text(reply.rep)
+        )));
+    }
+    let domain_len = if reply.atyp == consts::ATYP_DOMAIN {
+        let mut len_byte = [0u8; 1];
+        if read_exact(io, fd, &mut len_byte, timeouts).is_err() {
+            io.raw_close(fd);
+            return Err(std::io::Error::other("读取 BND 域名长度失败"));
+        }
+        Some(len_byte[0])
+    } else {
+        None
+    };
+    let tail = match socks5::reply_tail_len(reply.atyp, domain_len) {
+        Some(t) => t,
+        None => {
+            io.raw_close(fd);
+            return Err(std::io::Error::other("响应 ATYP 未知"));
+        }
+    };
+    let mut tail_buf = vec![0u8; tail];
+    if let Err(e) = read_exact(io, fd, &mut tail_buf, timeouts) {
+        io.raw_close(fd);
+        return Err(e);
+    }
+
+    // 解析 relay 地址（core 回 IPv4 127.0.0.1）
+    let relay = match reply.atyp {
+        consts::ATYP_IPV4 => SocketAddr::from((
+            std::net::Ipv4Addr::new(tail_buf[0], tail_buf[1], tail_buf[2], tail_buf[3]),
+            u16::from_be_bytes([tail_buf[4], tail_buf[5]]),
+        )),
+        consts::ATYP_IPV6 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&tail_buf[..16]);
+            SocketAddr::from((
+                std::net::Ipv6Addr::from(octets),
+                u16::from_be_bytes([tail_buf[16], tail_buf[17]]),
+            ))
+        }
+        _ => {
+            io.raw_close(fd);
+            return Err(std::io::Error::other("core relay 域名形式不支持"));
+        }
+    };
+    Ok((fd, relay))
+}
+
 /// 在原 fd 上连接本地核心并完成 SOCKS5 协商。
 fn dial_core_in_place(io: &dyn SockIo, fd: i64, host: &str, port: u16) -> std::io::Result<()> {
     let cfg = config();
@@ -523,6 +649,12 @@ mod tests {
         fn core_addr(&self) -> Option<SocketAddr> {
             Some(self.core)
         }
+
+        fn raw_socket(&self) -> i64 {
+            42 // mock：任意正 fd
+        }
+
+        fn raw_close(&self, _fd: i64) {}
     }
 
     #[test]
