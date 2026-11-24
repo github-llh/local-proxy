@@ -81,16 +81,17 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 ## 快速开始
 
 ```bash
-# 前置：Rust stable、Node 22+、pnpm 9+
+# 前置：Rust stable、Node 22+、pnpm 9+；前端依赖已装（ui/node_modules）
+export PATH="$HOME/.cargo/bin:$PATH"
 cargo build --workspace
 
-# 方式一：完整应用（菜单栏）
+# 方式一：完整应用（菜单栏）——注意在 src-tauri 目录调用 ui 下的 CLI
 codesign -s - target/debug/liblocalproxy_shim_macos.dylib   # macOS 首次必需
-pnpm --dir src-tauri tauri dev
+cd src-tauri && ../ui/node_modules/.bin/tauri dev
 
 # 方式二：仅核心（CLI，无 UI）
-cargo run -p localproxy-core -- --config ./config.json
-curl -x socks5://127.0.0.1:1080 https://example.com
+cargo run -p localproxy-core
+curl -x socks5://127.0.0.1:1080 https://example.com   # 另一个终端
 
 # 一键自检（注入链路 14 组断言：UDP 封堵/放行、DNS 零泄露、
 # FakeIP、非阻塞 connect、UDP 全代理、未注入对照）
