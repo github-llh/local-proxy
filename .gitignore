@@ -1,0 +1,51 @@
+# ===== Rust =====
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# ===== Node / 前端 =====
+node_modules/
+ui/node_modules/
+ui/dist/
+npm-debug.log*
+pnpm-debug.log*
+
+# ===== Tauri =====
+src-tauri/gen/
+src-tauri/target/
+
+# ===== 构建产物 / 打包输出 =====
+*.app
+*.dmg
+*.msi
+*.exe
+*.rpm
+*.deb
+*.AppImage
+bundle/
+output/
+dist/
+build/
+build-*/
+
+# ===== 本地运行数据 =====
+*.log
+log/
+logs/
+.local/
+
+# ===== IDE / 系统 =====
+.idea/
+.vscode/
+*.swp
+.DS_Store
+[Tt]humbs.db
+.sanshu-memory/
+
+# ===== 旧项目遗留（Antigravity 时代产物） =====
+antigravity-oauth-*
+*.pref
+app_path.txt
+agy_path.txt
+dll_resources/
+microsoft/

@@ -1,0 +1,16 @@
+[package]
+name = "localproxy-shim-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy Windows 注入 shim：DLL 注入 + vendored MinHook"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+localproxy-shim = { workspace = true }
+localproxy-net = { workspace = true }
+
+# M4：vendored MinHook 的 cc 构建将在此重新引入

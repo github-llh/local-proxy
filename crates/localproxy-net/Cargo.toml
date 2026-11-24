@@ -1,0 +1,8 @@
+[package]
+name = "localproxy-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy 共享网络协议库：SOCKS5/HTTP 客户端、FakeIP、域名映射、本地目标判定"
+
+[dependencies]

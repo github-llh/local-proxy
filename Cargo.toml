@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/localproxy-net",
+    "crates/localproxy-core",
+    "crates/localproxy-shim",
+    "crates/localproxy-shim-macos",
+    "crates/localproxy-shim-win",
+    "crates/localproxy-launcher",
+    "src-tauri",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+localproxy-net = { path = "crates/localproxy-net" }
+localproxy-shim = { path = "crates/localproxy-shim" }
+localproxy-launcher = { path = "crates/localproxy-launcher" }

@@ -1,0 +1,14 @@
+[package]
+name = "localproxy-shim-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy macOS 注入 shim：DYLD_INSERT_LIBRARIES + __interpose 段 hook"
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+localproxy-shim = { workspace = true }
+localproxy-net = { workspace = true }

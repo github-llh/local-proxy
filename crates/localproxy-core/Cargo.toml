@@ -1,0 +1,24 @@
+[package]
+name = "localproxy-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy 本地代理核心：SOCKS5/HTTP 服务、规则路由、上游级联、控制面、CLI"
+
+[lib]
+name = "localproxy_core"
+path = "src/lib.rs"
+
+[[bin]]
+name = "localproxy-core"
+path = "src/main.rs"
+
+[dependencies]
+localproxy-net = { workspace = true }
+localproxy-launcher = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+clap.workspace = true

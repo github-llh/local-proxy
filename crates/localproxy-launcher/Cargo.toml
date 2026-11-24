@@ -1,0 +1,9 @@
+[package]
+name = "localproxy-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy 平台启动器：macOS .app 解析/exec + DYLD 注入，Windows CreateProcess + DLL 注入"
+
+[dependencies]
+serde.workspace = true

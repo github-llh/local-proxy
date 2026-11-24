@@ -1,0 +1,10 @@
+[package]
+name = "localproxy-shim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LocalProxy 注入 shim 公共逻辑：FakeIP 映射、SOCKS5 拨号、重入防护、平台抽象"
+
+[dependencies]
+localproxy-net = { workspace = true }
+tracing.workspace = true
