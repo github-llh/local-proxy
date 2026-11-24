@@ -2007,6 +2007,7 @@ name = "localproxy-launcher"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "tracing",
 ]
 
 [[package]]
@@ -2017,6 +2018,7 @@ version = "0.1.0"
 name = "localproxy-shim"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "localproxy-net",
  "tracing",
 ]
@@ -2025,8 +2027,10 @@ dependencies = [
 name = "localproxy-shim-macos"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "localproxy-net",
  "localproxy-shim",
+ "tracing",
 ]
 
 [[package]]

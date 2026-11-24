@@ -7,4 +7,5 @@ description = "LocalProxy 注入 shim 公共逻辑：FakeIP 映射、SOCKS5 拨�
 
 [dependencies]
 localproxy-net = { workspace = true }
+libc = "0.2"
 tracing.workspace = true
