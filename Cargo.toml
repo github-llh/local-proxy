@@ -23,5 +23,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 localproxy-net = { path = "crates/localproxy-net" }
+localproxy-core = { path = "crates/localproxy-core" }
 localproxy-shim = { path = "crates/localproxy-shim" }
 localproxy-launcher = { path = "crates/localproxy-launcher" }
