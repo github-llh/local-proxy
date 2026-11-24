@@ -5,6 +5,7 @@ members = [
     "crates/localproxy-shim",
     "crates/localproxy-shim-macos",
     "crates/localproxy-shim-win",
+    "crates/localproxy-inject",
     "crates/localproxy-launcher",
     "src-tauri",
 ]
@@ -26,3 +27,4 @@ localproxy-net = { path = "crates/localproxy-net" }
 localproxy-core = { path = "crates/localproxy-core" }
 localproxy-shim = { path = "crates/localproxy-shim" }
 localproxy-launcher = { path = "crates/localproxy-launcher" }
+localproxy-inject = { path = "crates/localproxy-inject" }

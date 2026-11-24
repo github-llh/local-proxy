@@ -27,14 +27,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use localproxy_shim::config::ShimConfig;
 use localproxy_shim::engine;
 use windows_sys::s;
-use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+use windows_sys::Win32::Foundation::{BOOL, FALSE, HANDLE, TRUE};
 use windows_sys::Win32::Networking::WinSock::{
     connect as sys_connect, getaddrinfo as sys_getaddrinfo, recv as sys_recv, send as sys_send,
     GetAddrInfoW as sys_GetAddrInfoW, WSAGetLastError, WSAStartup, ADDRINFOW, INVALID_SOCKET,
     SEND_RECV_FLAGS, SOCKADDR, SOCKET,
 };
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::System::Threading::{
+    CreateProcessA as sys_CreateProcessA, CreateProcessW as sys_CreateProcessW,
+    GetCurrentProcessId, PROCESS_INFORMATION, STARTUPINFOW,
+};
 
 // ============= 原函数 trampoline =============
 
@@ -393,6 +396,143 @@ fn ensure_installed() {
     INSTALLED.store(true, Ordering::SeqCst);
 }
 
+/// 本进程已成功注入的子进程数（防注入风暴上限）。
+static CHILD_INJECT_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 子进程注入策略（环境变量）。
+struct ChildPolicy {
+    /// `all`（默认）：全部子进程；`same-dir`：仅同目录二进制
+    mode: String,
+    /// 排除列表（分号分隔，子串匹配可执行路径）
+    exclude: Vec<String>,
+    /// 注入数量上限
+    max: u32,
+}
+
+impl ChildPolicy {
+    fn from_env() -> Self {
+        let mode = std::env::var("LP_CHILD_MODE").unwrap_or_else(|_| "all".to_string());
+        let exclude = std::env::var("LP_CHILD_EXCLUDE")
+            .map(|s| {
+                s.split(';')
+                    .map(|x| x.trim().to_ascii_lowercase())
+                    .filter(|x| !x.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let max = std::env::var("LP_CHILD_MAX")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        Self { mode, exclude, max }
+    }
+
+    /// 目标命令行是否应注入。
+    fn should_inject(&self, cmd_line_lower: &str) -> bool {
+        if self.exclude.iter().any(|e| cmd_line_lower.contains(e)) {
+            return false;
+        }
+        match self.mode.as_str() {
+            "same-dir" => {
+                // 与 shim DLL 同目录（同 bundle 的 Electron 多进程场景）
+                match self_shim_dir() {
+                    Some(dir) => {
+                        // 命令行中任一路径片段位于同目录
+                        cmd_line_lower.contains(&dir.to_ascii_lowercase())
+                    }
+                    None => true,
+                }
+            }
+            _ => true, // all
+        }
+    }
+
+    fn count_ok(&self) -> bool {
+        CHILD_INJECT_COUNT.load(Ordering::Relaxed) < self.max
+    }
+}
+
+/// shim 自身 DLL 所在目录（小写宽字符串）。
+fn self_shim_dir() -> Option<String> {
+    let mut buf = vec![0u16; 260];
+    let len = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if len == 0 {
+        return None;
+    }
+    let path = String::from_utf16_lossy(&buf[..len as usize]);
+    std::path::Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().to_string())
+}
+
+/// 读取宽字符命令行（至 NUL）。
+unsafe fn read_wide(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    // SAFETY: ptr 为宽字符串
+    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// 向新创建的子进程注入 shim（失败仅记录，不影响父进程行为）。
+fn inject_child(pi: &PROCESS_INFORMATION) {
+    let policy = ChildPolicy::from_env();
+    if !policy.count_ok() {
+        tracing::debug!("shim-win: 子进程注入达上限 {}，跳过", policy.max);
+        return;
+    }
+    if pi.dwProcessId == unsafe { GetCurrentProcessId() } {
+        return; // 不会发生，防御
+    }
+    let Some(dll_path) = self_shim_path() else {
+        return;
+    };
+    if let Err(e) = localproxy_inject::inject_dll(pi.hProcess, &dll_path) {
+        tracing::debug!("shim-win: 子进程注入失败 pid={}: {e}", pi.dwProcessId);
+        return;
+    }
+    if let Err(e) =
+        localproxy_inject::call_remote_export(pi.hProcess, &dll_path, "localproxy_shim_init")
+    {
+        tracing::debug!("shim-win: 子进程 init 失败 pid={}: {e}", pi.dwProcessId);
+        return;
+    }
+    CHILD_INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
+    tracing::info!(
+        "shim-win: 子进程注入成功 pid={}（累计 {}）",
+        pi.dwProcessId,
+        CHILD_INJECT_COUNT.load(Ordering::Relaxed)
+    );
+}
+
+/// shim 自身 DLL 完整路径。
+fn self_shim_path() -> Option<std::path::PathBuf> {
+    let mut buf = vec![0u16; 260];
+    let len = unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
+            std::ptr::null_mut(),
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+        )
+    };
+    if len == 0 {
+        return None;
+    }
+    Some(std::path::PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
+}
+
 /// DLL 加载完成后的初始化入口（注入方二次远程调用）。
 ///
 /// 返回 true 表示安装成功。
@@ -460,6 +600,26 @@ unsafe fn install_hooks() -> bool {
         ORIG_GETADDRINFOW
     );
 
+    // kernel32: CreateProcessW/A（子进程注入）
+    let kernel32 = match unsafe {
+        windows_sys::Win32::System::LibraryLoader::GetModuleHandleA(s!("kernel32.dll"))
+    } {
+        h if !h.is_null() => h,
+        _ => return false,
+    };
+    let cpw_addr = unsafe { GetProcAddress(kernel32, s!("CreateProcessW")) } as *const c_void;
+    let cpa_addr = unsafe { GetProcAddress(kernel32, s!("CreateProcessA")) } as *const c_void;
+    hook!(
+        cpw_addr,
+        hook_CreateProcessW as *mut c_void,
+        ORIG_CREATE_PROCESS_W
+    );
+    hook!(
+        cpa_addr,
+        hook_CreateProcessA as *mut c_void,
+        ORIG_CREATE_PROCESS_A
+    );
+
     match unsafe { MinHook::enable_all_hooks() } {
         Ok(()) => true,
         Err(e) => {
@@ -467,6 +627,271 @@ unsafe fn install_hooks() -> bool {
             false
         }
     }
+}
+
+// ============= hook: CreateProcess（子进程注入 P0.4） =============
+//
+// Chromium/Electron 的网络栈在独立子进程（network_service/utility/renderer）中，
+// macOS 靠 DYLD_INSERT_LIBRARIES 天然继承，Windows 必须 hook CreateProcess
+// 主动注入，否则这些子进程的网络全部直连泄漏。
+
+const CREATE_SUSPENDED_FLAG: u32 = 0x0000_0004;
+
+type CreateProcessWFn = unsafe extern "system" fn(
+    *const u16,
+    *mut u16,
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    BOOL,
+    u32,
+    *const std::ffi::c_void,
+    *const u16,
+    *const STARTUPINFOW,
+    *mut PROCESS_INFORMATION,
+) -> BOOL;
+type CreateProcessAFn = unsafe extern "system" fn(
+    *const u8,
+    *mut u8,
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    BOOL,
+    u32,
+    *const std::ffi::c_void,
+    *const u8,
+    *const std::ffi::c_void,
+    *mut PROCESS_INFORMATION,
+) -> BOOL;
+
+static mut ORIG_CREATE_PROCESS_W: Option<CreateProcessWFn> = None;
+static mut ORIG_CREATE_PROCESS_A: Option<CreateProcessAFn> = None;
+
+/// `CreateProcessW` 替换实现。
+unsafe extern "system" fn hook_CreateProcessW(
+    app_name: *const u16,
+    cmd_line: *mut u16,
+    process_attrs: *const std::ffi::c_void,
+    thread_attrs: *const std::ffi::c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *const std::ffi::c_void,
+    cwd: *const u16,
+    startup_info: *const STARTUPINFOW,
+    process_info: *mut PROCESS_INFORMATION,
+) -> BOOL {
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return call_orig_cpw(
+            app_name,
+            cmd_line,
+            process_attrs,
+            thread_attrs,
+            inherit,
+            flags,
+            env,
+            cwd,
+            startup_info,
+            process_info,
+        );
+    };
+
+    // 强制挂起（调用方未要求时），注入后恢复
+    let caller_suspended = flags & CREATE_SUSPENDED_FLAG != 0;
+    let ok = call_orig_cpw(
+        app_name,
+        cmd_line,
+        process_attrs,
+        thread_attrs,
+        inherit,
+        flags | CREATE_SUSPENDED_FLAG,
+        env,
+        cwd,
+        startup_info,
+        process_info,
+    );
+    if ok != 0 && !process_info.is_null() {
+        // SAFETY: 原函数成功时 process_info 有效
+        let pi = unsafe { &*process_info };
+        let policy = ChildPolicy::from_env();
+        let cmd_lower = unsafe { read_wide(cmd_line) }.to_ascii_lowercase();
+        if policy.should_inject(&cmd_lower) {
+            inject_child(pi);
+        }
+        if !caller_suspended {
+            unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) };
+        }
+    }
+    ok
+}
+
+unsafe fn call_orig_cpw(
+    app_name: *const u16,
+    cmd_line: *mut u16,
+    process_attrs: *const std::ffi::c_void,
+    thread_attrs: *const std::ffi::c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *const std::ffi::c_void,
+    cwd: *const u16,
+    startup_info: *const STARTUPINFOW,
+    process_info: *mut PROCESS_INFORMATION,
+) -> BOOL {
+    // SAFETY: install 后 ORIG_CREATE_PROCESS_W 已填充
+    match unsafe { ORIG_CREATE_PROCESS_W } {
+        Some(f) => unsafe {
+            f(
+                app_name,
+                cmd_line,
+                process_attrs,
+                thread_attrs,
+                inherit,
+                flags,
+                env,
+                cwd,
+                startup_info,
+                process_info,
+            )
+        },
+        None => unsafe {
+            sys_CreateProcessW(
+                app_name,
+                cmd_line,
+                process_attrs,
+                thread_attrs,
+                inherit,
+                flags,
+                env,
+                cwd,
+                startup_info,
+                process_info,
+            )
+        },
+    }
+}
+
+/// `CreateProcessA` 替换实现（ANSI；策略与 W 版一致）。
+unsafe extern "system" fn hook_CreateProcessA(
+    app_name: *const u8,
+    cmd_line: *mut u8,
+    process_attrs: *const std::ffi::c_void,
+    thread_attrs: *const std::ffi::c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *const std::ffi::c_void,
+    cwd: *const u8,
+    startup_info: *const std::ffi::c_void,
+    process_info: *mut PROCESS_INFORMATION,
+) -> BOOL {
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return call_orig_cpa(
+            app_name,
+            cmd_line,
+            process_attrs,
+            thread_attrs,
+            inherit,
+            flags,
+            env,
+            cwd,
+            startup_info,
+            process_info,
+        );
+    };
+
+    let caller_suspended = flags & CREATE_SUSPENDED_FLAG != 0;
+    let ok = call_orig_cpa(
+        app_name,
+        cmd_line,
+        process_attrs,
+        thread_attrs,
+        inherit,
+        flags | CREATE_SUSPENDED_FLAG,
+        env,
+        cwd,
+        startup_info,
+        process_info,
+    );
+    if ok != 0 && !process_info.is_null() {
+        // SAFETY: 原函数成功时 process_info 有效
+        let pi = unsafe { &*process_info };
+        let policy = ChildPolicy::from_env();
+        let cmd_lower = unsafe { read_ansi(cmd_line) }.to_ascii_lowercase();
+        if policy.should_inject(&cmd_lower) {
+            inject_child(pi);
+        }
+        if !caller_suspended {
+            unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) };
+        }
+    }
+    ok
+}
+
+unsafe fn call_orig_cpa(
+    app_name: *const u8,
+    cmd_line: *mut u8,
+    process_attrs: *const std::ffi::c_void,
+    thread_attrs: *const std::ffi::c_void,
+    inherit: BOOL,
+    flags: u32,
+    env: *const std::ffi::c_void,
+    cwd: *const u8,
+    startup_info: *const std::ffi::c_void,
+    process_info: *mut PROCESS_INFORMATION,
+) -> BOOL {
+    // SAFETY: install 后 ORIG_CREATE_PROCESS_A 已填充
+    match unsafe { ORIG_CREATE_PROCESS_A } {
+        Some(f) => unsafe {
+            f(
+                app_name,
+                cmd_line,
+                process_attrs,
+                thread_attrs,
+                inherit,
+                flags,
+                env,
+                cwd,
+                startup_info,
+                process_info,
+            )
+        },
+        None => unsafe {
+            sys_CreateProcessA(
+                app_name,
+                cmd_line,
+                process_attrs,
+                thread_attrs,
+                inherit,
+                flags,
+                env,
+                cwd,
+                startup_info,
+                process_info,
+            )
+        },
+    }
+}
+
+/// 读取宽字符命令行（至 NUL，上限 4096）。
+unsafe fn read_wide(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    // SAFETY: ptr 为宽字符串
+    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
+        len += 1;
+    }
+    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
+}
+
+/// 读取 ANSI 命令行（至 NUL，上限 4096）。
+unsafe fn read_ansi(ptr: *const u8) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    // SAFETY: ptr 为 ANSI 字符串
+    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
+        len += 1;
+    }
+    String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).to_string()
 }
 
 // ============= DllMain =============

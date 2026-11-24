@@ -15,6 +15,7 @@ path = "src/lib.rs"
 [target.'cfg(windows)'.dependencies]
 localproxy-shim = { workspace = true }
 localproxy-net = { workspace = true }
+localproxy-inject = { workspace = true }
 tracing.workspace = true
 minhook = "0.1"
 windows-sys = { version = "0.59", features = [
