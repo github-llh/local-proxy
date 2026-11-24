@@ -153,12 +153,15 @@ pub fn has_hardened_runtime(binary: &Path) -> Result<bool, LaunchError> {
 ///
 /// - `shim_path`：shim dylib 绝对路径（`DYLD_INSERT_LIBRARIES`）
 /// - `core_host` / `core_port` / `fakeip_cidr`：shim 环境变量
+/// - `udp_mode` / `ipv6_mode`：安全策略（由 core 配置解析后注入，缺省 block/proxy）
 pub fn launch(
     entry: &AppEntry,
     shim_path: &Path,
     core_host: &str,
     core_port: u16,
     fakeip_cidr: &str,
+    udp_mode: &str,
+    ipv6_mode: &str,
 ) -> Result<Session, LaunchError> {
     let resolved = resolve_binary(&entry.path_buf())?;
 
@@ -186,6 +189,8 @@ pub fn launch(
     command.env("LP_CORE_PORT", core_port.to_string());
     command.env("LP_FAKEIP_CIDR", fakeip_cidr);
     command.env("LP_MODE", "proxy");
+    command.env("LP_UDP_MODE", udp_mode);
+    command.env("LP_IPV6_MODE", ipv6_mode);
     // bundle 内应用的工作目录设为 bundle 根（资源加载兼容）
     if let Some(root) = &resolved.bundle_root {
         command.current_dir(root);

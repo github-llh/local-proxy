@@ -37,6 +37,45 @@ extern "C" {
         hints: *const libc::addrinfo,
         res: *mut *mut libc::addrinfo,
     ) -> c_int;
+    fn sendto(
+        fd: c_int,
+        msg: *const c_void,
+        len: usize,
+        flags: c_int,
+        to: *const libc::sockaddr,
+        tolen: libc::socklen_t,
+    ) -> isize;
+    fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize;
+}
+
+/// 查询 socket 类型（SO_TYPE）；失败返回 None。
+unsafe fn getsockopt_type(fd: RawFd) -> Option<c_int> {
+    let mut val: c_int = 0;
+    let mut len = std::mem::size_of::<c_int>() as libc::socklen_t;
+    // SAFETY: 栈上有效缓冲区
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut val as *mut c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc == 0 {
+        Some(val)
+    } else {
+        None
+    }
+}
+
+/// SOCK_DGRAM = 2 / SOCK_STREAM = 1（各平台稳定 ABI 常量）。
+const SOCK_STREAM: c_int = 1;
+const SOCK_DGRAM: c_int = 2;
+
+/// 设置 errno（macOS: *__error()）。
+unsafe fn set_errno(code: c_int) {
+    unsafe { *libc::__error() = code };
 }
 
 // ============= 初始化（懒加载） =============
@@ -117,6 +156,8 @@ static IO: MacOsIo = MacOsIo;
 // ============= hook: connect =============
 
 /// `connect` 替换实现。
+///
+/// SOCK_STREAM → TCP 就地协商；SOCK_DGRAM（connected UDP socket）→ UDP 策略。
 #[no_mangle]
 pub extern "C" fn localproxy_connect(
     fd: RawFd,
@@ -135,12 +176,109 @@ pub extern "C" fn localproxy_connect(
         return unsafe { connect(fd, addr, len) };
     };
 
+    // connected DGRAM socket：走 UDP 策略（block/direct）
+    // SAFETY: fd 为有效 socket
+    if unsafe { getsockopt_type(fd) } == Some(SOCK_DGRAM) {
+        return match engine::proxy_udp(&target) {
+            engine::UdpOutcome::Direct => unsafe { connect(fd, addr, len) },
+            engine::UdpOutcome::Blocked(e) => {
+                unsafe { set_errno(e.raw_os_error().unwrap_or(engine::ERR_NET_UNREACH)) };
+                -1
+            }
+            // S2 落地前 engine 已将 Proxy 收敛为 Blocked；双保险
+            engine::UdpOutcome::Proxy => {
+                unsafe { set_errno(engine::ERR_NET_UNREACH) };
+                -1
+            }
+        };
+    }
+
+    let _ = SOCK_STREAM;
     match engine::proxy_connect(&IO, fd as i64, &target) {
         Ok(true) => 0,                                  // 已就地代理成功
         Ok(false) => unsafe { connect(fd, addr, len) }, // 直连放行
-        Err(_) => {
-            // 以 ECONNREFUSED 语义失败（应用侧表现与普通连接失败一致）
-            unsafe { *libc::__error() = libc::ECONNREFUSED };
+        Err(e) => {
+            // 保留原有 errno 语义（ECONNREFUSED 兜底，应用侧表现与普通连接失败一致）
+            unsafe { set_errno(e.raw_os_error().unwrap_or(libc::ECONNREFUSED)) };
+            -1
+        }
+    }
+}
+
+// ============= hook: sendto / sendmsg（UDP 封堵 P0.1） =============
+
+/// `sendto` 替换实现：公网 UDP 按 `udp_mode` 阻断（默认 block）。
+#[no_mangle]
+pub extern "C" fn localproxy_sendto(
+    fd: RawFd,
+    msg: *const c_void,
+    len: usize,
+    flags: c_int,
+    to: *const libc::sockaddr,
+    tolen: libc::socklen_t,
+) -> isize {
+    ensure_installed();
+
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return unsafe { sendto(fd, msg, len, flags, to, tolen) };
+    };
+
+    // 无目标地址（connected socket 的 sendto 语义）：决策已在 connect hook 做出
+    if to.is_null() {
+        return unsafe { sendto(fd, msg, len, flags, to, tolen) };
+    }
+    // SAFETY: 调用方保证 to/tolen 有效
+    let Some(target) = (unsafe { parse_sockaddr(to, tolen) }) else {
+        return unsafe { sendto(fd, msg, len, flags, to, tolen) };
+    };
+
+    match engine::proxy_udp(&target) {
+        engine::UdpOutcome::Direct => unsafe { sendto(fd, msg, len, flags, to, tolen) },
+        engine::UdpOutcome::Blocked(e) => {
+            tracing::debug!("shim: sendto 阻断 {}:{}", target.ip(), target.port());
+            unsafe { set_errno(e.raw_os_error().unwrap_or(engine::ERR_NET_UNREACH)) };
+            -1
+        }
+        engine::UdpOutcome::Proxy => {
+            unsafe { set_errno(engine::ERR_NET_UNREACH) };
+            -1
+        }
+    }
+}
+
+/// `sendmsg` 替换实现：等价 sendto（目标在 msghdr.msg_name）。
+#[no_mangle]
+pub extern "C" fn localproxy_sendmsg(fd: RawFd, msg: *const libc::msghdr, flags: c_int) -> isize {
+    ensure_installed();
+
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return unsafe { sendmsg(fd, msg, flags) };
+    };
+    if msg.is_null() {
+        return unsafe { sendmsg(fd, msg, flags) };
+    }
+    // SAFETY: 调用方保证 msg 有效
+    let m = unsafe { &*msg };
+    if m.msg_name.is_null() {
+        // connected socket：决策已在 connect hook 做出
+        return unsafe { sendmsg(fd, msg, flags) };
+    }
+    // SAFETY: msg_name/msg_namelen 构成有效 sockaddr
+    let Some(target) =
+        (unsafe { parse_sockaddr(m.msg_name as *const libc::sockaddr, m.msg_namelen) })
+    else {
+        return unsafe { sendmsg(fd, msg, flags) };
+    };
+
+    match engine::proxy_udp(&target) {
+        engine::UdpOutcome::Direct => unsafe { sendmsg(fd, msg, flags) },
+        engine::UdpOutcome::Blocked(e) => {
+            tracing::debug!("shim: sendmsg 阻断 {}:{}", target.ip(), target.port());
+            unsafe { set_errno(e.raw_os_error().unwrap_or(engine::ERR_NET_UNREACH)) };
+            -1
+        }
+        engine::UdpOutcome::Proxy => {
+            unsafe { set_errno(engine::ERR_NET_UNREACH) };
             -1
         }
     }
@@ -267,6 +405,20 @@ static INTERPOSE_CONNECT: InterposePair = InterposePair {
 static INTERPOSE_GETADDRINFO: InterposePair = InterposePair {
     replacement: localproxy_getaddrinfo as *const c_void,
     original: getaddrinfo as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_SENDTO: InterposePair = InterposePair {
+    replacement: localproxy_sendto as *const c_void,
+    original: sendto as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_SENDMSG: InterposePair = InterposePair {
+    replacement: localproxy_sendmsg as *const c_void,
+    original: sendmsg as *const c_void,
 };
 
 /// shim 构造入口（供测试或手动初始化）。

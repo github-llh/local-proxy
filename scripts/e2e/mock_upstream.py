@@ -84,11 +84,28 @@ def handle(conn: socket.socket, seen_path: str) -> None:
         conn.close()
 
 
+def udp_echo_loop(sock: socket.socket, seen_path: str) -> None:
+    """UDP echo：记录每个收到的包（供断言放行/阻断）。"""
+    while True:
+        try:
+            data, addr = sock.recvfrom(4096)
+        except OSError:
+            return
+        with open(seen_path, "a") as f:
+            f.write(f"{addr[0]}:{addr[1]} {data.decode('utf-8', 'replace')}\n")
+        try:
+            sock.sendto(data, addr)
+        except OSError:
+            return
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=19080)
     parser.add_argument("--seen", default="/tmp/lp-e2e-seen.txt")
     parser.add_argument("--ready-file", default=None)
+    parser.add_argument("--udp-port", type=int, default=0, help="UDP echo 端口（0=不监听）")
+    parser.add_argument("--udp-seen", default="/tmp/lp-e2e-udp-seen.txt")
     args = parser.parse_args()
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -99,6 +116,14 @@ def main() -> int:
     if args.ready_file:
         with open(args.ready_file, "w") as f:
             f.write("ready")
+
+    # UDP echo（验证「局域网 UDP 放行、公网 UDP 阻断」）
+    if args.udp_port > 0:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp.bind(("127.0.0.1", args.udp_port))
+        print(f"[mock] udp echo on 127.0.0.1:{args.udp_port}", flush=True)
+        threading.Thread(target=udp_echo_loop, args=(udp, args.udp_seen), daemon=True).start()
 
     try:
         while True:

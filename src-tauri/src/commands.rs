@@ -127,7 +127,7 @@ pub fn remove_app(state: State<'_, AppState>, id: String) -> Result<(), String> 
 pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo, String> {
     prune_sessions(&state);
 
-    let (entry, core_host, core_port, fakeip_cidr) = {
+    let (entry, core_host, core_port, fakeip_cidr, udp_mode, ipv6_mode) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let entry = config
             .apps
@@ -135,11 +135,24 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             .find(|a| a.id == id)
             .cloned()
             .ok_or_else(|| "应用不存在".to_string())?;
+        // 安全策略由 core 配置解析：udp_mode × 上游类型 → 有效动作
+        let upstream_type = config
+            .upstream
+            .active_server()
+            .map(|s| s.server_type.clone())
+            .unwrap_or_default();
+        let udp = config
+            .proxy_rules
+            .effective_udp_action(&upstream_type)
+            .name()
+            .to_string();
         (
             entry,
             config.listen_host.clone(),
             config.socks5_port,
             "198.18.0.0/15".to_string(),
+            udp,
+            config.proxy_rules.ipv6_mode.clone(),
         )
     };
 
@@ -157,7 +170,15 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
     }
 
     // 平台分发
-    let session = launch_via_platform(&entry, &shim, &core_host, core_port, &fakeip_cidr)?;
+    let session = launch_via_platform(
+        &entry,
+        &shim,
+        &core_host,
+        core_port,
+        &fakeip_cidr,
+        &udp_mode,
+        &ipv6_mode,
+    )?;
 
     let info = SessionInfo {
         entry_id: session.entry_id.clone(),
@@ -181,11 +202,21 @@ fn launch_via_platform(
     core_host: &str,
     core_port: u16,
     fakeip_cidr: &str,
+    udp_mode: &str,
+    ipv6_mode: &str,
 ) -> Result<crate::state::AppSession, String> {
     use localproxy_launcher::macos;
 
-    let session =
-        macos::launch(entry, shim, core_host, core_port, fakeip_cidr).map_err(|e| e.to_string())?;
+    let session = macos::launch(
+        entry,
+        shim,
+        core_host,
+        core_port,
+        fakeip_cidr,
+        udp_mode,
+        ipv6_mode,
+    )
+    .map_err(|e| e.to_string())?;
     Ok(crate::state::AppSession {
         entry_id: session.entry_id,
         entry_name: entry.name.clone(),
@@ -201,12 +232,22 @@ fn launch_via_platform(
     core_host: &str,
     core_port: u16,
     fakeip_cidr: &str,
+    udp_mode: &str,
+    ipv6_mode: &str,
 ) -> Result<crate::state::AppSession, String> {
     use localproxy_launcher::windows;
     use windows::Win32::System::Threading::GetProcessId;
 
-    let session = windows::launch(entry, shim, core_host, core_port, fakeip_cidr)
-        .map_err(|e| e.to_string())?;
+    let session = windows::launch(
+        entry,
+        shim,
+        core_host,
+        core_port,
+        fakeip_cidr,
+        udp_mode,
+        ipv6_mode,
+    )
+    .map_err(|e| e.to_string())?;
     let pid = unsafe { GetProcessId(session.process) };
     Ok(crate::state::AppSession {
         entry_id: session.entry_id,
@@ -223,6 +264,8 @@ fn launch_via_platform(
     _core_host: &str,
     _core_port: u16,
     _fakeip_cidr: &str,
+    _udp_mode: &str,
+    _ipv6_mode: &str,
 ) -> Result<crate::state::AppSession, String> {
     Err("当前平台不支持启动注入".to_string())
 }

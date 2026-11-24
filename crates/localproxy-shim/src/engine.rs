@@ -21,7 +21,7 @@ use localproxy_net::fakeip::FakeIp;
 use localproxy_net::local_target;
 use localproxy_net::socks5::{self, consts, ProxyAuth, Timeouts};
 
-use crate::config::{ShimConfig, ShimMode};
+use crate::config::{Ipv6Mode, ShimConfig, ShimMode, UdpMode};
 
 /// 全局配置（首次 install 后不变）。
 static CONFIG: std::sync::OnceLock<ShimConfig> = std::sync::OnceLock::new();
@@ -182,6 +182,98 @@ pub fn parse_service_port(service: Option<&str>) -> u16 {
 
 // ============= connect 就地代理 =============
 
+/// 平台 errno：网络不可达（促使 QUIC→TCP、WebRTC→TCP candidate 的标准降级信号）。
+/// macOS/Linux: ENETUNREACH=51；Windows: WSAENETUNREACH=10051。
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
+pub const ERR_NET_UNREACH: i32 = 51;
+#[cfg(target_os = "windows")]
+pub const ERR_NET_UNREACH: i32 = 10051;
+
+/// 平台 errno：地址族不支持（阻断公网 IPv6）。
+/// macOS/Linux: EAFNOSUPPORT=97；Windows: WSAEAFNOSUPPORT=10047。
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "ios"))]
+pub const ERR_AF_NOT_SUPPORTED: i32 = 97;
+#[cfg(target_os = "windows")]
+pub const ERR_AF_NOT_SUPPORTED: i32 = 10047;
+
+/// UDP 阻断错误（应用视角：网络不可达 → 回退 TCP）。
+pub fn udp_blocked_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(ERR_NET_UNREACH)
+}
+
+/// IPv6 阻断错误。
+pub fn ipv6_blocked_error() -> std::io::Error {
+    std::io::Error::from_raw_os_error(ERR_AF_NOT_SUPPORTED)
+}
+
+/// IPv6 策略判定（P0.2）。
+///
+/// 在 `should_bypass`（回环/私网已放行）之后调用：
+/// - `Ok(false)`：直连放行（`ipv6_mode=direct`）
+/// - `Ok(true)`：继续走代理（`ipv6_mode=proxy`）
+/// - `Err`：阻断（`ipv6_mode=block`，公网 v6）
+pub fn check_ipv6_policy(target: &SocketAddr) -> std::io::Result<bool> {
+    let SocketAddr::V6(v6) = target else {
+        return Ok(true); // v4 不受 v6 策略影响
+    };
+    let ip = *v6.ip();
+    if is_private_ipv6(ip) || ip.is_loopback() {
+        return Ok(false); // 内网/回环 v6 直连
+    }
+    match config().ipv6_mode {
+        Ipv6Mode::Block => Err(ipv6_blocked_error()),
+        Ipv6Mode::Direct => Ok(false),
+        Ipv6Mode::Proxy => Ok(true),
+    }
+}
+
+/// UDP 发送决策（P0.1）。
+///
+/// 覆盖 `sendto`/`sendmsg`/`WSASendTo` 与 connected DGRAM socket 的 `connect`：
+/// - 回环/私网/mDNS → `Direct`（正常应用行为不受影响）
+/// - `udp_mode=direct` → `Direct`
+/// - `udp_mode=block`（默认）→ `Blocked`（`ENETUNREACH` 促使应用回退 TCP）
+/// - `udp_mode=proxy` → `Proxy`（S2 实现；当前回落 Blocked 并记录）
+#[derive(Debug)]
+pub enum UdpOutcome {
+    /// 放行原始 sendto
+    Direct,
+    /// 阻断（附错误，hook 层设置 errno 并返回 -1）
+    Blocked(std::io::Error),
+    /// 走 UDP 代理（S2）
+    Proxy,
+}
+
+pub fn proxy_udp(target: &SocketAddr) -> UdpOutcome {
+    let cfg = config();
+    if cfg.mode == ShimMode::Direct || !is_installed() {
+        return UdpOutcome::Direct;
+    }
+    if should_bypass(target) {
+        return UdpOutcome::Direct;
+    }
+    match cfg.udp_mode {
+        UdpMode::Direct => UdpOutcome::Direct,
+        UdpMode::Block => {
+            tracing::debug!(
+                "shim: UDP block {}:{}（回退 TCP 信号）",
+                target.ip(),
+                target.port()
+            );
+            UdpOutcome::Blocked(udp_blocked_error())
+        }
+        UdpMode::Proxy => {
+            // S2 落地前按 block 处理（fail-closed），并明确记录
+            tracing::debug!(
+                "shim: UDP proxy 尚未实现，临时按 block {}:{}",
+                target.ip(),
+                target.port()
+            );
+            UdpOutcome::Blocked(udp_blocked_error())
+        }
+    }
+}
+
 /// 代理一次 TCP connect（在原 fd 上就地协商）。
 ///
 /// - `Ok(true)`：已代为完成代理连接，hook 层应返回 0
@@ -193,6 +285,11 @@ pub fn proxy_connect(io: &dyn SockIo, fd: i64, target: &SocketAddr) -> std::io::
         return Ok(false);
     }
     if should_bypass(target) {
+        return Ok(false);
+    }
+
+    // IPv6 策略（P0.2）：公网 v6 按 ipv6_mode 决策
+    if !check_ipv6_policy(target)? {
         return Ok(false);
     }
 
@@ -534,5 +631,67 @@ mod tests {
         let ok = proxy_connect(&io, 7, &"192.168.1.5:443".parse().unwrap()).unwrap();
         assert!(!ok, "私网目标应直连");
         assert!(io.connected_to.lock().unwrap().is_empty());
+    }
+
+    // ---- UDP 策略（P0.1） ----
+
+    #[test]
+    fn udp_public_blocked_by_default() {
+        install(&ShimConfig::default());
+        // 默认 udp_mode=block：公网 UDP 阻断（WebRTC STUN/QUIC/DNS 外泄面）
+        let outcome = proxy_udp(&"8.8.8.8:53".parse().unwrap());
+        assert!(
+            matches!(outcome, UdpOutcome::Blocked(ref e) if e.raw_os_error() == Some(ERR_NET_UNREACH)),
+            "公网 UDP 默认应阻断: {outcome:?}"
+        );
+        let outcome = proxy_udp(&"1.1.1.1:443".parse().unwrap());
+        assert!(matches!(outcome, UdpOutcome::Blocked(_)));
+    }
+
+    #[test]
+    fn udp_local_direct() {
+        install(&ShimConfig::default());
+        // 回环/私网/mDNS 语义地址：直连放行（不误伤正常应用）
+        for addr in [
+            "127.0.0.1:53",
+            "192.168.1.5:5353",
+            "10.0.0.1:9999",
+            "172.16.0.9:3478",
+        ] {
+            let outcome = proxy_udp(&addr.parse().unwrap());
+            assert!(
+                matches!(outcome, UdpOutcome::Direct),
+                "{addr} 应直连放行: {outcome:?}"
+            );
+        }
+    }
+
+    // ---- IPv6 策略（P0.2） ----
+
+    #[test]
+    fn ipv6_policy_default_proxy() {
+        install(&ShimConfig::default());
+        // 默认 ipv6_mode=proxy：公网 v6 走代理
+        assert!(check_ipv6_policy(&"[2001:db8::1]:443".parse().unwrap()).unwrap());
+        // 内网/回环 v6 直连
+        assert!(!check_ipv6_policy(&"[fd00::1]:443".parse().unwrap()).unwrap());
+        assert!(!check_ipv6_policy(&"[::1]:443".parse().unwrap()).unwrap());
+        assert!(!check_ipv6_policy(&"[fe80::1]:443".parse().unwrap()).unwrap());
+        // v4 不受 v6 策略影响
+        assert!(check_ipv6_policy(&"8.8.8.8:443".parse().unwrap()).unwrap());
+    }
+
+    #[test]
+    fn errno_values() {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            assert_eq!(ERR_NET_UNREACH, 51);
+            assert_eq!(ERR_AF_NOT_SUPPORTED, 97);
+        }
+        assert_eq!(udp_blocked_error().raw_os_error(), Some(ERR_NET_UNREACH));
+        assert_eq!(
+            ipv6_blocked_error().raw_os_error(),
+            Some(ERR_AF_NOT_SUPPORTED)
+        );
     }
 }

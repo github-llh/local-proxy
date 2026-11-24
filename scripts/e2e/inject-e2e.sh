@@ -19,8 +19,10 @@ PY="$REPO_ROOT/../../.dsh/dsh-runtimes/dsh-primary-runtime/dependencies/python/b
 if [ ! -x "$PY" ]; then PY="python3"; fi
 
 MOCK_PORT=19080
+MOCK_UDP_PORT=19081
 CORE_SOCKS_PORT=11080
 SEEN_FILE=/tmp/lp-e2e-seen.txt
+UDP_SEEN_FILE=/tmp/lp-e2e-udp-seen.txt
 READY_FILE=/tmp/lp-e2e-mock-ready
 CONFIG_FILE=/tmp/lp-e2e-config.json
 SHIM="$REPO_ROOT/target/debug/liblocalproxy_shim_macos.dylib"
@@ -39,9 +41,9 @@ cargo build -p localproxy-core -p localproxy-shim-macos 2>&1 | tail -1
 echo "== 2. adhoc 签名 shim（arm64 加载必需） =="
 codesign -s - "$SHIM"
 
-echo "== 3. 启动 mock 上游 =="
-rm -f "$SEEN_FILE" "$READY_FILE"
-"$PY" "$REPO_ROOT/scripts/e2e/mock_upstream.py" --port "$MOCK_PORT" --seen "$SEEN_FILE" --ready-file "$READY_FILE" &
+echo "== 3. 启动 mock 上游（TCP + UDP echo） =="
+rm -f "$SEEN_FILE" "$READY_FILE" "$UDP_SEEN_FILE"
+"$PY" "$REPO_ROOT/scripts/e2e/mock_upstream.py" --port "$MOCK_PORT" --seen "$SEEN_FILE" --ready-file "$READY_FILE" --udp-port "$MOCK_UDP_PORT" --udp-seen "$UDP_SEEN_FILE" &
 MOCK_PID=$!
 for _ in $(seq 1 50); do [ -f "$READY_FILE" ] && break; sleep 0.1; done
 
@@ -85,6 +87,35 @@ BEFORE=$(wc -l < "$SEEN_FILE")
 /tmp/lp-e2e-client example.com 80 > /tmp/lp-e2e-body-direct.txt 2>/dev/null || true
 AFTER=$(wc -l < "$SEEN_FILE")
 [ "$BEFORE" = "$AFTER" ] && echo "PASS: 未注入流量未经过核心（mock 记录数不变）" || echo "WARN: 未注入流量意外到达 mock（$BEFORE -> $AFTER）"
+
+echo "== 8. UDP 封堵断言（WebRTC/QUIC 防泄漏） =="
+# 8.1 公网 UDP（STUN 3478）：注入后 sendto 必须失败（block，errno=ENETUNREACH=51）
+# 注意：客户端被阻断时返回 exit 2（预期语义），需 || true 避免 set -e 中断
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  /tmp/lp-e2e-client --udp 8.8.8.8 3478 > /tmp/lp-e2e-udp-pub.txt 2>/dev/null || true
+grep -q "UDP_SENDTO_FAILED errno=51" /tmp/lp-e2e-udp-pub.txt \
+  && echo "PASS: 公网 UDP sendto 被阻断（errno=51 ENETUNREACH，应用将回退 TCP）" \
+  || { echo "FAIL: 公网 UDP 未被阻断"; cat /tmp/lp-e2e-udp-pub.txt; exit 1; }
+# 8.2 未注入对照：同一目标 sendto 成功（证明阻断来自 shim 而非环境）
+/tmp/lp-e2e-client --udp 8.8.8.8 3478 > /tmp/lp-e2e-udp-pub-direct.txt 2>/dev/null || true
+grep -q "UDP_SENDTO_OK" /tmp/lp-e2e-udp-pub-direct.txt \
+  && echo "PASS: 未注入时公网 UDP 正常（对照组，证明阻断来自注入）" \
+  || { echo "FAIL: 对照组异常（未注入也不通？检查网络）"; cat /tmp/lp-e2e-udp-pub-direct.txt; exit 1; }
+# 8.3 局域网 UDP：注入后必须放行（不误伤正常应用）
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  /tmp/lp-e2e-client --udp 127.0.0.1 $MOCK_UDP_PORT > /tmp/lp-e2e-udp-lan.txt 2>/dev/null || true
+grep -q "UDP_SENDTO_OK" /tmp/lp-e2e-udp-lan.txt \
+  && echo "PASS: 局域网 UDP sendto 放行（不误伤）" \
+  || { echo "FAIL: 局域网 UDP 被误伤"; cat /tmp/lp-e2e-udp-lan.txt; exit 1; }
+sleep 0.3
+grep -q "LP-UDP-PROBE" "$UDP_SEEN_FILE" \
+  && echo "PASS: mock UDP 收到回环探测包（放行路径数据可达）" \
+  || { echo "FAIL: mock UDP 未收到探测包"; cat "$UDP_SEEN_FILE" 2>/dev/null; exit 1; }
+# 8.4 mock UDP 不应收到任何公网来源阻断包的残留（block 在发送前生效）
+if grep -qv "127.0.0.1" "$UDP_SEEN_FILE" 2>/dev/null; then
+  echo "FAIL: mock UDP 收到非回环包（泄漏？）"; cat "$UDP_SEEN_FILE"; exit 1
+fi
+echo "PASS: mock UDP 仅收到回环包（无泄漏）"
 
 echo ""
 echo "===== M2 端到端验证全部通过 ====="

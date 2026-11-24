@@ -80,12 +80,15 @@ fn to_wide(path: &Path) -> Vec<u16> {
 ///
 /// - `shim_path`：shim DLL 绝对路径
 /// - `core_host` / `core_port` / `fakeip_cidr`：经环境变量传给 shim
+/// - `udp_mode` / `ipv6_mode`：安全策略（block/direct/proxy、proxy/direct/block）
 pub fn launch(
     entry: &AppEntry,
     shim_path: &Path,
     core_host: &str,
     core_port: u16,
     fakeip_cidr: &str,
+    udp_mode: &str,
+    ipv6_mode: &str,
 ) -> Result<Session, LaunchError> {
     let exe = entry.path_buf();
     if !exe.exists() {
@@ -109,6 +112,8 @@ pub fn launch(
     env_pairs.push(("LP_CORE_PORT".into(), core_port.to_string()));
     env_pairs.push(("LP_FAKEIP_CIDR".into(), fakeip_cidr.into()));
     env_pairs.push(("LP_MODE".into(), "proxy".into()));
+    env_pairs.push(("LP_UDP_MODE".into(), udp_mode.into()));
+    env_pairs.push(("LP_IPV6_MODE".into(), ipv6_mode.into()));
     let env_block = build_environment_block(&env_pairs);
 
     let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
