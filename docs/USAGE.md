@@ -39,6 +39,28 @@ popover/设置中可热切换（不影响已建连接）。首次启动未配置
 - 优先级：`order`（数组序，首个命中生效）或 `number`（priority 降序）；
 - 内网/回环地址默认自动直连（可关闭）。
 
+## UDP 策略（WebRTC/QUIC）
+
+| `udp_mode` | 行为 | 适用 |
+|:--|:--|:--|
+| `block`（默认） | 阻断公网 UDP，返回 `ENETUNREACH` 促使应用回退 TCP | 防泄漏优先（API/网页场景，QUIC 自动回落 TCP） |
+| `proxy` | SOCKS5 UDP Associate 全代理（ASSOCIATE + 双向 relay） | WebRTC 实时音视频等必须 UDP 的场景 |
+| `direct` | UDP 直连放行 | 排障对照 |
+
+局域网/回环/mDNS 的 UDP 在任何模式下均直连放行（不误伤本地投屏、mDNS 发现等）。
+`auto` 会按上游类型解析为 proxy（SOCKS5 上游）或按 `udp_fallback` 处理。
+
+## 风控自检
+
+popover「风控自检」卡片（探测默认关闭，在设置 → 高级开启后点击触发）：
+- **出口探测**：经上游访问 HTTP 端点，显示出口 IP / 国家 / 城市 / ISP——即被代理应用可见的出口身份；
+- **一致性校验**：出口国家 vs 系统时区 vs 系统语言，任一匹配即一致，都不匹配给警告
+  （对应 Certta/Verisoul 等平台的 Timezone Mismatch 检测规则）；
+- **泄漏自检**：browserleaks.com 一键打开（检测浏览器指纹；注入应用的泄漏用「最近连接」佐证）。
+
+「最近连接」折叠列表展示每个连接的目标、路由（proxy/direct/blocked）与命中规则，
+排障与泄漏投诉时可举证 fail-closed 生效。
+
 ## 与 Clash / V2RayN 等代理软件共存
 
 LocalProxy 定位是 **per-app 注入层**，Clash Verge / ClashX / mihomo / V2RayN 等作为
