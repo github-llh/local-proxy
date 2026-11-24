@@ -179,8 +179,26 @@ pub fn launch(
 }
 
 /// 构造 Windows 环境变量块（NUL 分隔的宽字符串，双 NUL 结尾，需按 key 排序）。
+///
+/// 同时清理代理环境变量（`http_proxy` 等）：被注入应用应处于「无代理」环境，
+/// 由 shim 全权接管，避免与 Clash 等代理软件的系统代理双跳。
 fn build_environment_block(pairs: &[(String, String)]) -> Vec<u16> {
-    let mut sorted: Vec<&(String, String)> = pairs.iter().collect();
+    const PROXY_ENV_VARS: [&str; 10] = [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "ftp_proxy",
+        "FTP_PROXY",
+        "no_proxy",
+        "NO_PROXY",
+    ];
+    let mut sorted: Vec<&(String, String)> = pairs
+        .iter()
+        .filter(|(k, _)| !PROXY_ENV_VARS.contains(&k.as_str()))
+        .collect();
     sorted.sort_by(|a, b| a.0.to_uppercase().cmp(&b.0.to_uppercase()));
     let mut block: Vec<u16> = Vec::new();
     for (k, v) in sorted {

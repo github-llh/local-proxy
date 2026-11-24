@@ -37,6 +37,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(path) => AppConfig::load(std::path::Path::new(path))?,
         None => AppConfig::default(),
     };
+
+    // 启动前校验：防自环（上游指向自身监听端口）
+    config.validate()?;
+    // 端口预检：与 Clash/V2RayN 等代理软件共存时给出友好错误
+    config.check_ports_available()?;
+
     let listen_host = config.listen_host.clone();
     let socks5_port = config.socks5_port;
     let http_port = config.http_port;

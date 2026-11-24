@@ -149,6 +149,24 @@ pub fn has_hardened_runtime(binary: &Path) -> Result<bool, LaunchError> {
     Ok(text.contains("runtime"))
 }
 
+/// 需要清理的代理环境变量（大小写组合）。
+///
+/// Clash/V2RayN 等会设置系统代理与这些环境变量；若不清理，被注入应用会把
+/// 连接发往代理软件的系统代理端口（双跳且行为不可预期）。清理后应用处于
+/// 「无代理」环境，由 shim 全权接管。
+const PROXY_ENV_VARS: [&str; 10] = [
+    "http_proxy",
+    "HTTP_PROXY",
+    "https_proxy",
+    "HTTPS_PROXY",
+    "all_proxy",
+    "ALL_PROXY",
+    "ftp_proxy",
+    "FTP_PROXY",
+    "no_proxy",
+    "NO_PROXY",
+];
+
 /// 以代理模式启动应用（注入 shim dylib）。
 ///
 /// - `shim_path`：shim dylib 绝对路径（`DYLD_INSERT_LIBRARIES`）
@@ -191,6 +209,10 @@ pub fn launch(
     command.env("LP_MODE", "proxy");
     command.env("LP_UDP_MODE", udp_mode);
     command.env("LP_IPV6_MODE", ipv6_mode);
+    // 清理系统代理环境变量：shim 全权接管，避免与 Clash 等代理软件双跳
+    for var in PROXY_ENV_VARS {
+        command.env_remove(var);
+    }
     // bundle 内应用的工作目录设为 bundle 根（资源加载兼容）
     if let Some(root) = &resolved.bundle_root {
         command.current_dir(root);

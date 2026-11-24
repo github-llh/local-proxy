@@ -499,6 +499,60 @@ impl AppConfig {
     pub fn control_endpoint(&self) -> String {
         format!("{}:{}", self.listen_host, self.control_port)
     }
+
+    /// 校验配置合法性（启动前调用）。
+    ///
+    /// 重点：**防自环**——上游指向本核心的监听端口（如把 Clash 的上游配成
+    /// 自己的 1080，或链式代理配反）会形成无限回环，必须拒绝启动。
+    pub fn validate(&self) -> Result<(), String> {
+        let self_ports = [self.socks5_port, self.http_port, self.control_port];
+        for server in &self.upstream.servers {
+            let host = server.host.trim();
+            let is_local = host.eq_ignore_ascii_case("localhost")
+                || host == "127.0.0.1"
+                || host.starts_with("127.")
+                || host == "::1"
+                || host == "[::1]";
+            if is_local && self_ports.contains(&server.port) {
+                return Err(format!(
+                    "上游 {}({}) 指向本核心监听端口 {}：会形成代理回环。\
+                     请改为真实的代理软件端口（如 Clash 的 7890），或修改本核心端口。",
+                    server.name, server.id, server.port
+                ));
+            }
+        }
+        // 上游端口为 0（sanitize 已回退默认，双保险）
+        for server in &self.upstream.servers {
+            if server.port == 0 {
+                return Err(format!("上游 {}({}) 端口为 0", server.name, server.id));
+            }
+        }
+        Ok(())
+    }
+
+    /// 探测端口是否可绑定（启动前预检，给出友好错误）。
+    pub fn check_ports_available(&self) -> Result<(), String> {
+        for (name, port) in [
+            ("SOCKS5", self.socks5_port),
+            ("HTTP CONNECT", self.http_port),
+            ("控制面", self.control_port),
+        ] {
+            match std::net::TcpListener::bind((self.listen_host.as_str(), port)) {
+                Ok(_) => {} // 立即 drop，仅探测
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Err(format!(
+                        "{name} 端口 {} 已被占用（可能是 Clash/V2RayN 等代理软件或其它实例）。\
+                         请在设置中修改端口后重试。",
+                        port
+                    ));
+                }
+                Err(e) => {
+                    return Err(format!("{name} 端口 {} 绑定失败: {e}", port));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// 生成随机 hex token（时间熵 + 栈地址熵，非密码学强度但足够本机鉴权）。
@@ -625,5 +679,40 @@ mod tests {
             cfg.proxy_rules.effective_udp_action("http"),
             localproxy_net::udp::UdpAction::Block
         );
+    }
+
+    #[test]
+    fn validate_rejects_self_loop_upstream() {
+        // 上游指向自身 SOCKS5 端口（链式代理配反/Clash 反环）→ 拒绝
+        let mut cfg = AppConfig::default();
+        cfg.upstream.servers[0].port = cfg.socks5_port;
+        cfg.upstream.servers[0].host = "127.0.0.1".to_string();
+        let err = cfg.validate().unwrap_err();
+        assert!(err.contains("回环"), "错误信息应说明回环: {err}");
+
+        // localhost + 控制面端口同样拒绝
+        cfg.upstream.servers[0].port = cfg.control_port;
+        cfg.upstream.servers[0].host = "localhost".to_string();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn validate_accepts_clash_upstream() {
+        // Clash 默认 mixed 端口 7890：合法（不同端口）
+        let mut cfg = AppConfig::default();
+        cfg.upstream.servers[0].port = 7890;
+        assert!(cfg.validate().is_ok());
+        // 回环 host 但端口不同 → 合法
+        cfg.upstream.servers[0].host = "127.0.0.1".to_string();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn check_ports_available_ok_for_defaults() {
+        // 默认端口（1080-1082）通常空闲；若被占则跳过（CI 环境不定）
+        let cfg = AppConfig::default();
+        if let Err(e) = cfg.check_ports_available() {
+            assert!(e.contains("端口"), "错误信息应含端口: {e}");
+        }
     }
 }
