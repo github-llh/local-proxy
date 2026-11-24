@@ -201,6 +201,33 @@ impl ProxyRules {
     }
 }
 
+// ============= 探测（风控自检） =============
+
+/// 出口 IP 探测设置。
+///
+/// 默认 HTTP 明文端点（经上游 SOCKS5 隧道访问，无需 TLS 依赖）；
+/// 探测**默认关闭**（`ui.exit_ip_probe`），仅用户显式开启后由 App 触发。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProbeSettings {
+    /// 探测端点（HTTP 明文优先；JSON 含 query/countryCode/city/isp）
+    pub endpoints: Vec<String>,
+    /// 超时（毫秒）
+    pub timeout_ms: u64,
+}
+
+impl Default for ProbeSettings {
+    fn default() -> Self {
+        Self {
+            endpoints: vec![
+                "http://ip-api.com/json?lang=zh-CN".to_string(),
+                "http://members.3322.org/dyndns/getip".to_string(),
+            ],
+            timeout_ms: 5000,
+        }
+    }
+}
+
 // ============= UI =============
 
 /// 界面设置（App 使用；core 只透传不解释）。
@@ -249,6 +276,7 @@ pub struct AppConfig {
     pub proxy_rules: ProxyRules,
     pub apps: Vec<localproxy_launcher::app_entry::AppEntry>,
     pub ui: UiSettings,
+    pub probe: ProbeSettings,
 }
 
 impl Default for AppConfig {
@@ -266,6 +294,7 @@ impl Default for AppConfig {
             proxy_rules: ProxyRules::default(),
             apps: Vec::new(),
             ui: UiSettings::default(),
+            probe: ProbeSettings::default(),
         }
     }
 }

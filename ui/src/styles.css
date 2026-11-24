@@ -382,3 +382,21 @@ select:focus {
   accent-color: var(--accent);
   flex-shrink: 0;
 }
+
+/* 风控自检卡片 */
+.risk-card {
+  margin-top: 6px;
+}
+
+.consistency {
+  margin: 8px 0 0;
+  font-size: 13px;
+}
+
+.consistency.ok {
+  color: var(--ok);
+}
+
+.consistency.warn {
+  color: var(--warn);
+}

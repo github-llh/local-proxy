@@ -6,15 +6,37 @@ import {
   pickAppFile,
   type AppEntry,
   type CoreStatus,
+  type ExitIpInfo,
   type SessionInfo,
   type UpstreamServer,
 } from "../api";
 import { useT } from "../i18n";
+import { checkConsistency, systemContext } from "../consistency";
+import { open } from "@tauri-apps/plugin-shell";
 
 function formatUptime(secs: number): string {
   if (secs < 60) return `${secs}s`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ${secs % 60}s`;
   return `${Math.floor(secs / 3600)}h ${Math.floor((secs % 3600) / 60)}m`;
+}
+
+
+/// 一致性徽标（出口国家 vs 系统时区/语言）。
+function ConsistencyBadge({ countryCode }: { countryCode: string }) {
+  const t = useT();
+  const { timeZone, language } = systemContext();
+  const result = checkConsistency(countryCode, timeZone, language);
+  if (result.level === "ok") {
+    return <p className="consistency ok">✅ {t("risk.consistent")}</p>;
+  }
+  if (result.level === "warn") {
+    return (
+      <p className="consistency warn" title={`${timeZone} / ${language}`}>
+        ⚠️ {t("risk.mismatch")} {result.detail}
+      </p>
+    );
+  }
+  return null;
 }
 
 export default function Popover() {
@@ -29,6 +51,8 @@ export default function Popover() {
   const [activeUpstreamId, setActiveUpstreamId] = useState("");
   const [latencies, setLatencies] = useState<Record<string, number>>({});
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [exitIp, setExitIp] = useState<ExitIpInfo | null>(null);
+  const [probing, setProbing] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -92,6 +116,26 @@ export default function Popover() {
       setError(String(e));
     } finally {
       setTestingId(null);
+    }
+  };
+
+  const handleProbe = async () => {
+    setProbing(true);
+    try {
+      const info = await api.probeExitIp();
+      setExitIp(info);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setProbing(false);
+    }
+  };
+
+  const handleLeakTest = async () => {
+    try {
+      await open("https://browserleaks.com/webrtc");
+    } catch (e) {
+      setError(String(e));
     }
   };
 
@@ -204,6 +248,46 @@ export default function Popover() {
           <dt>{t("popover.http")}</dt>
           <dd>127.0.0.1:{status?.http_port ?? "-"}</dd>
         </dl>
+      </section>
+
+      <section className="section">
+        <div className="section-head">
+          <h2>{t("risk.title")}</h2>
+          <div className="row-actions">
+            <button className="btn btn-small" onClick={handleProbe} disabled={probing}>
+              {probing ? "…" : t("risk.probe")}
+            </button>
+            <button className="btn btn-small btn-ghost" onClick={handleLeakTest}>
+              {t("risk.leakTest")}
+            </button>
+          </div>
+        </div>
+        {exitIp ? (
+          <div className="card risk-card">
+            <dl className="kv">
+              <dt>{t("risk.exitIp")}</dt>
+              <dd>{exitIp.ip || "-"}</dd>
+              {exitIp.country && (
+                <>
+                  <dt>{t("risk.location")}</dt>
+                  <dd>
+                    {exitIp.country}
+                    {exitIp.city ? ` · ${exitIp.city}` : ""}
+                  </dd>
+                </>
+              )}
+              {exitIp.isp && (
+                <>
+                  <dt>ISP</dt>
+                  <dd>{exitIp.isp}</dd>
+                </>
+              )}
+            </dl>
+            <ConsistencyBadge countryCode={exitIp.country_code} />
+          </div>
+        ) : (
+          <p className="muted">{t("risk.hint")}</p>
+        )}
       </section>
 
       <section className="section">

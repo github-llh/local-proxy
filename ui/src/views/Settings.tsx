@@ -517,6 +517,27 @@ export default function Settings() {
           />
           {t("settings.exitIpProbe")}
         </label>
+        <p className="muted">{t("settings.probeEndpointsHint")}</p>
+        <textarea
+          rows={2}
+          value={config.probe.endpoints.join("\n")}
+          onChange={(e) =>
+            patch((c) => {
+              c.probe.endpoints = e.target.value
+                .split("\n")
+                .map((s) => s.trim())
+                .filter(Boolean);
+            })
+          }
+        />
+        <label>
+          {t("settings.probeTimeout")}
+          <input
+            type="number"
+            value={config.probe.timeout_ms}
+            onChange={(e) => patch((c) => (c.probe.timeout_ms = Number(e.target.value)))}
+          />
+        </label>
       </section>
     </main>
   );

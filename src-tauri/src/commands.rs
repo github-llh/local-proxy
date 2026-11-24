@@ -203,6 +203,20 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
     Ok(info)
 }
 
+/// 出口 IP 探测（风控自检；经上游 SOCKS5 访问 HTTP 端点）。
+#[tauri::command]
+pub fn probe_exit_ip(state: State<'_, AppState>) -> Result<crate::probe::ExitIpInfo, String> {
+    let (core_endpoint, endpoints, timeout_ms) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (
+            config.socks5_endpoint(),
+            config.probe.endpoints.clone(),
+            config.probe.timeout_ms,
+        )
+    };
+    crate::probe::probe_exit_ip(&core_endpoint, &endpoints, timeout_ms).map_err(|e| e.to_string())
+}
+
 /// 当前 Unix 时间戳（秒）。
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()

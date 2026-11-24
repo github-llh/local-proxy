@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "LocalProxy 默认权限：核心 + 文件选择对话框",
+  "description": "LocalProxy 默认权限：核心 + 文件选择对话框 + 打开外部链接（泄漏自检页）",
   "windows": ["*"],
   "permissions": [
     "core:default",
     "core:window:allow-start-dragging",
-    "dialog:default"
+    "dialog:default",
+    "shell:allow-open"
   ]
 }

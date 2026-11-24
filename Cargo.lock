@@ -2022,6 +2022,7 @@ dependencies = [
  "libc",
  "localproxy-core",
  "localproxy-launcher",
+ "localproxy-net",
  "serde",
  "serde_json",
  "tauri",

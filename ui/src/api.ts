@@ -52,6 +52,14 @@ export interface RoutingRule {
   protocols: string[];
 }
 
+export interface ExitIpInfo {
+  ip: string;
+  country_code: string;
+  country: string;
+  city: string;
+  isp: string;
+}
+
 export interface AppConfig {
   listen_host: string;
   socks5_port: number;
@@ -83,6 +91,10 @@ export interface AppConfig {
     keep_core_alive: boolean;
     exit_ip_probe: boolean;
   };
+  probe: {
+    endpoints: string[];
+    timeout_ms: number;
+  };
 }
 
 export const api = {
@@ -98,6 +110,7 @@ export const api = {
   setAppEnabled: (id: string, enabled: boolean) =>
     invoke<void>("set_app_enabled", { id, enabled }),
   testUpstream: (id: string) => invoke<number>("test_upstream", { id }),
+  probeExitIp: () => invoke<ExitIpInfo>("probe_exit_ip"),
   getConfig: () => invoke<AppConfig>("get_config"),
   saveConfig: (config: AppConfig) => invoke<void>("save_config", { config }),
   selectUpstream: (id: string) => invoke<void>("select_upstream", { id }),
