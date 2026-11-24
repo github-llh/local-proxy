@@ -173,7 +173,7 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
     Ok(info)
 }
 
-/// 平台启动分发（macOS 实现；Windows 在 M4）。
+/// 平台启动分发（macOS：DYLD 注入；Windows：挂起进程 + DLL 注入）。
 #[cfg(target_os = "macos")]
 fn launch_via_platform(
     entry: &AppEntry,
@@ -194,7 +194,29 @@ fn launch_via_platform(
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn launch_via_platform(
+    entry: &AppEntry,
+    shim: &Path,
+    core_host: &str,
+    core_port: u16,
+    fakeip_cidr: &str,
+) -> Result<crate::state::AppSession, String> {
+    use localproxy_launcher::windows;
+    use windows::Win32::System::Threading::GetProcessId;
+
+    let session = windows::launch(entry, shim, core_host, core_port, fakeip_cidr)
+        .map_err(|e| e.to_string())?;
+    let pid = unsafe { GetProcessId(session.process) };
+    Ok(crate::state::AppSession {
+        entry_id: session.entry_id,
+        entry_name: entry.name.clone(),
+        pid,
+        started_at: std::time::Instant::now(),
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn launch_via_platform(
     _entry: &AppEntry,
     _shim: &Path,
@@ -202,7 +224,7 @@ fn launch_via_platform(
     _core_port: u16,
     _fakeip_cidr: &str,
 ) -> Result<crate::state::AppSession, String> {
-    Err("Windows 启动注入在 M4 提供".to_string())
+    Err("当前平台不支持启动注入".to_string())
 }
 
 /// 停止运行中的应用（按 entry id）。
@@ -298,9 +320,28 @@ fn pid_alive(pid: u32) -> bool {
         // SAFETY: kill(pid, 0) 仅探测存在性
         unsafe { libc::kill(pid as i32, 0) == 0 || *libc::__error() == libc::EPERM }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Windows 兜底：M4 用 OpenProcess 查询
+        use windows::Win32::Foundation::CloseHandle;
+        use windows::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: OpenProcess 失败返回 NULL
+        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
+        match process {
+            Ok(h) if !h.is_invalid() => {
+                let mut code = 0u32;
+                let ok = unsafe { GetExitCodeProcess(h, &mut code) };
+                unsafe { CloseHandle(h) };
+                // STILL_ACTIVE = 259
+                ok.is_ok() && code == 259
+            }
+            _ => false,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
         true
     }
 }

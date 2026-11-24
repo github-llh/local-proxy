@@ -92,11 +92,12 @@ pub fn core_binary_path() -> PathBuf {
     }
 }
 
-/// shim dylib 路径（macOS：target/debug 或 App 同目录 Resources）。
+/// shim 二进制路径（macOS：target/debug 或 App Resources；Windows：App 同目录）。
 pub fn shim_binary_path() -> PathBuf {
+    let exe = std::env::current_exe().unwrap_or_default();
     if cfg!(target_os = "macos") {
         if cfg!(debug_assertions) {
-            let exe = std::env::current_exe().unwrap_or_default();
+            // 仓库根/target/debug/liblocalproxy_shim_macos.dylib
             let root = exe
                 .ancestors()
                 .nth(3)
@@ -104,14 +105,25 @@ pub fn shim_binary_path() -> PathBuf {
                 .unwrap_or_else(|| PathBuf::from("."));
             root.join("target/debug/liblocalproxy_shim_macos.dylib")
         } else {
-            let exe = std::env::current_exe().unwrap_or_default();
             // App.app/Contents/MacOS/app → ../Resources
             exe.parent()
                 .map(|p| p.join("../Resources/liblocalproxy_shim_macos.dylib"))
                 .unwrap_or_default()
         }
+    } else if cfg!(target_os = "windows") {
+        if cfg!(debug_assertions) {
+            let root = exe
+                .ancestors()
+                .nth(3)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            root.join("target/debug/localproxy_shim_win.dll")
+        } else {
+            // 与 App 可执行同目录（打包 sidecar 放置处）
+            exe.with_file_name("localproxy_shim_win.dll")
+        }
     } else {
-        PathBuf::from("localproxy-shim-win.dll")
+        PathBuf::from("localproxy-shim")
     }
 }
 

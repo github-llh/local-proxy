@@ -11,6 +11,9 @@
 //! - 被注入的 app 若启用 hardened runtime，系统会拒绝加载（launcher 会提前检测）；
 //! - 子进程经 `DYLD_INSERT_LIBRARIES` 环境变量自动继承注入。
 
+// 整个 crate 仅在 macOS target 编译（与 shim-win 的 #![cfg(windows)] 对称：
+// 保证在任一台机器上 `cargo check --workspace` 都不会尝试构建对方平台源码）。
+#![cfg(target_os = "macos")]
 #![allow(clippy::missing_safety_doc)]
 // FFI 导出函数（interpose 替换目标）：指针有效性由 C 调用约定保证，
 // 函数体内已用 unsafe 块解引用；不能标 unsafe fn（dyld 替换表需普通符号）。

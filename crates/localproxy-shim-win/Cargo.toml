@@ -9,8 +9,20 @@ description = "LocalProxy Windows 注入 shim：DLL 注入 + vendored MinHook"
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
-[dependencies]
+# 源码整体 #![cfg(windows)]：非 Windows target 上本 crate 为空壳，
+# 因此依赖也全部放在 cfg(windows) 下（避免 macOS 上拉取 minhook
+# 等仅 Windows 可构建的 crate）。
+[target.'cfg(windows)'.dependencies]
 localproxy-shim = { workspace = true }
 localproxy-net = { workspace = true }
-
-# M4：vendored MinHook 的 cc 构建将在此重新引入
+tracing.workspace = true
+minhook = "0.1"
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_Networking_WinSock",
+  "Win32_Security",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_Debug",
+] }

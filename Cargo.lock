@@ -2083,6 +2083,9 @@ version = "0.1.0"
 dependencies = [
  "localproxy-net",
  "localproxy-shim",
+ "minhook",
+ "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2151,6 +2154,16 @@ name = "mime"
 version = "0.3.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5848f5a9e8117cf94f2f90faac24a87ff81600ff8628c1e3deaab572e76bfa1"
+
+[[package]]
+name = "minhook"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3b177b3c6f6d812537eda79d9a4d5de37bfe9d02497384a581b017162d17cdd6"
+dependencies = [
+ "cc",
+ "tracing",
+]
 
 [[package]]
 name = "miniz_oxide"
