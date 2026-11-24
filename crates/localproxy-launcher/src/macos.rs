@@ -7,6 +7,7 @@
 //!   加载库（launcher 提前检测并给出明确错误）；
 //! - 子进程经环境变量自动继承注入（无需额外处理）。
 
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -221,6 +222,8 @@ pub fn launch(
         command.arg(arg);
     }
 
+    // 独立进程组：停止时可整组终止（.app 主进程退出时子进程不残留）
+    command.process_group(0);
     let child = command
         .stdin(Stdio::null())
         .spawn()

@@ -131,5 +131,12 @@ grep -q "GETHOSTBYNAME name=localhost addr=127\.0\.0\.1" /tmp/lp-e2e-dns-local.t
   && echo "PASS: localhost 走真实解析（不误伤）" \
   || { echo "FAIL: localhost 解析异常"; cat /tmp/lp-e2e-dns-local.txt; exit 1; }
 
+echo "== 10. 非阻塞 connect 断言（Electron/Chromium 默认模式回归） =="
+DYLD_INSERT_LIBRARIES="$SHIM" LP_CORE_HOST=127.0.0.1 LP_CORE_PORT=$CORE_SOCKS_PORT \
+  /tmp/lp-e2e-client --nonblock example.com 80 > /tmp/lp-e2e-nb.txt 2>/dev/null || true
+grep -q "MOCK-UPSTREAM-OK" /tmp/lp-e2e-nb.txt \
+  && echo "PASS: 非阻塞 connect 经注入正常工作（shim O_NONBLOCK 适配生效）" \
+  || { echo "FAIL: 非阻塞 connect 回归"; cat /tmp/lp-e2e-nb.txt; exit 1; }
+
 echo ""
 echo "===== M2 端到端验证全部通过 ====="

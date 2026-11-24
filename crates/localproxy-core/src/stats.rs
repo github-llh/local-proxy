@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 /// 统计快照。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct StatsSnapshot {
     /// 累计连接数
     pub connections_total: u64,

@@ -36,10 +36,18 @@ impl AppState {
     /// 构造：加载（或创建默认）配置。
     pub fn new() -> Self {
         let config_path = default_config_path();
-        let config = AppConfig::load(&config_path).unwrap_or_else(|e| {
+        let mut config = AppConfig::load(&config_path).unwrap_or_else(|e| {
             tracing::warn!("加载配置失败，使用默认值: {e}");
             AppConfig::default()
         });
+        // 控制面 token：为空则生成并立即落盘（core 启动时读取同一配置）
+        let token_was_empty = config.control_token.trim().is_empty();
+        config.ensure_control_token();
+        if token_was_empty {
+            if let Err(e) = config.save(&config_path) {
+                tracing::warn!("保存生成的 control_token 失败: {e}");
+            }
+        }
         Self {
             config: Mutex::new(config),
             config_path,

@@ -211,8 +211,26 @@ pub extern "C" fn localproxy_connect(
     }
 
     let _ = SOCK_STREAM;
-    match engine::proxy_connect(&IO, fd as i64, &target) {
-        Ok(true) => 0,                                  // 已就地代理成功
+    // 非阻塞 socket 适配：现代应用（Electron/Chromium）默认非阻塞 connect，
+    // 期望 EINPROGRESS + 后续可写通知。就地协商是同步的，因此临时清除
+    // O_NONBLOCK、协商完成后恢复——与 proxychains 同款策略。
+    // SAFETY: fd 为有效 socket
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    let was_nonblocking = flags >= 0 && (flags & libc::O_NONBLOCK) != 0;
+    if was_nonblocking {
+        // SAFETY: fd 有效，flags 来自 F_GETFL
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    }
+
+    let result = engine::proxy_connect(&IO, fd as i64, &target);
+
+    if was_nonblocking {
+        // SAFETY: fd 有效
+        unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
+    }
+
+    match result {
+        Ok(true) => 0,                                  // 已就地代理成功（含非阻塞适配）
         Ok(false) => unsafe { connect(fd, addr, len) }, // 直连放行
         Err(e) => {
             // 保留原有 errno 语义（ECONNREFUSED 兜底，应用侧表现与普通连接失败一致）

@@ -5,6 +5,7 @@ import {
   api,
   pickAppFile,
   type AppEntry,
+  type ConnectionRecord,
   type CoreStatus,
   type ExitIpInfo,
   type SessionInfo,
@@ -53,6 +54,8 @@ export default function Popover() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [exitIp, setExitIp] = useState<ExitIpInfo | null>(null);
   const [probing, setProbing] = useState(false);
+  const [showConns, setShowConns] = useState(false);
+  const [connections, setConnections] = useState<ConnectionRecord[]>([]);
 
   const refresh = useCallback(async () => {
     try {
@@ -78,6 +81,14 @@ export default function Popover() {
     const timer = setInterval(refresh, 3000);
     return () => clearInterval(timer);
   }, [refresh]);
+
+  useEffect(() => {
+    if (!showConns) return;
+    api
+      .listRecentConnections(20)
+      .then(setConnections)
+      .catch(() => setConnections([]));
+  }, [showConns]);
 
   const handleToggleCore = async () => {
     setBusy(true);
@@ -360,6 +371,34 @@ export default function Popover() {
               </li>
             ))}
           </ul>
+        )}
+      </section>
+
+      <section className="section">
+        <div className="section-head">
+          <h2>{t("conn.title")}</h2>
+          <button className="btn btn-small btn-ghost" onClick={() => setShowConns((v) => !v)}>
+            {showConns ? t("conn.collapse") : t("conn.expand")}
+          </button>
+        </div>
+        {showConns && (
+          <>
+            {connections.length === 0 ? (
+              <p className="muted">{t("conn.empty")}</p>
+            ) : (
+              <ul className="list conn-list">
+                {connections.map((c, i) => (
+                  <li key={`${c.ts_ms}-${i}`} className="list-item">
+                    <span className={`conn-dot ${c.action}`} />
+                    <span className="item-name" title={`${c.host}:${c.port}${c.rule ? ` · ${c.rule}` : ""}`}>
+                      {c.host}:{c.port}
+                    </span>
+                    <span className="muted">{c.action}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
         )}
       </section>
 

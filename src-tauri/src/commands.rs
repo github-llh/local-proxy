@@ -217,6 +217,22 @@ pub fn probe_exit_ip(state: State<'_, AppState>) -> Result<crate::probe::ExitIpI
     crate::probe::probe_exit_ip(&core_endpoint, &endpoints, timeout_ms).map_err(|e| e.to_string())
 }
 
+/// 最近连接记录（控制面诊断日志）。
+#[tauri::command]
+pub fn list_recent_connections(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+) -> Result<Vec<localproxy_core::diagnostics::ConnectionRecord>, String> {
+    let (endpoint, token) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        (config.control_endpoint(), config.control_token.clone())
+    };
+    let client = crate::control_client::ControlClient::new(endpoint, token);
+    client
+        .connections(limit.unwrap_or(50).min(500))
+        .map_err(|e| e.to_string())
+}
+
 /// 当前 Unix 时间戳（秒）。
 fn now_unix_secs() -> u64 {
     std::time::SystemTime::now()
@@ -356,11 +372,12 @@ pub fn stop_app(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let Some(pid) = target else {
         return Err("应用未在运行".to_string());
     };
-    // SIGTERM（Unix）/ TerminateProcess（Windows）
+    // Unix：杀进程组（launcher 启动时置于独立进程组，.app 子进程一并终止）；
+    // Windows：taskkill /T 树杀
     #[cfg(unix)]
     {
-        // SAFETY: pid 来自本进程启动的子进程
-        unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        // SAFETY: pid 来自本进程启动的子进程（进程组组长）
+        unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
     }
     #[cfg(not(unix))]
     {

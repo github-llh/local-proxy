@@ -11,6 +11,8 @@
  */
 
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <errno.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -70,11 +72,92 @@ static int dns_probe(const char *host) {
     return 0;
 }
 
+
+/// 非阻塞 HTTP 探测：O_NONBLOCK + connect(EINPROGRESS) + poll 可写 + SO_ERROR。
+/// 验证 shim 对非阻塞 connect 的适配（Electron/Chromium 默认模式）。
+static int nonblock_probe(const char *host, const char *port) {
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    struct addrinfo *res = NULL;
+    int gai = getaddrinfo(host, port, &hints, &res);
+    if (gai != 0 || res == NULL) {
+        fprintf(stderr, "getaddrinfo failed: %s\n", gai_strerror(gai));
+        return 1;
+    }
+
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        perror("socket");
+        freeaddrinfo(res);
+        return 1;
+    }
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+
+    int rc = connect(fd, res->ai_addr, res->ai_addrlen);
+    if (rc != 0 && errno != EINPROGRESS) {
+        printf("NONBLOCK_CONNECT_FAILED errno=%d (%s)\n", errno, strerror(errno));
+        perror("connect");
+        close(fd);
+        freeaddrinfo(res);
+        return 1;
+    }
+    fprintf(stderr, "nonblock connect rc=%d errno=%d (%s)\n", rc, errno, strerror(errno));
+
+    struct pollfd pfd = {.fd = fd, .events = POLLOUT};
+    int pr = poll(&pfd, 1, 10000);
+    if (pr <= 0) {
+        printf("NONBLOCK_POLL_TIMEOUT\n");
+        close(fd);
+        freeaddrinfo(res);
+        return 1;
+    }
+    int so_error = 0;
+    socklen_t slen = sizeof(so_error);
+    getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &slen);
+    if (so_error != 0) {
+        printf("NONBLOCK_SO_ERROR errno=%d (%s)\n", so_error, strerror(so_error));
+        close(fd);
+        freeaddrinfo(res);
+        return 1;
+    }
+    // 恢复阻塞后发送请求
+    fcntl(fd, F_SETFL, flags);
+
+    char request[512];
+    snprintf(request, sizeof(request),
+             "GET /e2e-test HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", host);
+    if (write(fd, request, strlen(request)) < 0) {
+        perror("write");
+        close(fd);
+        freeaddrinfo(res);
+        return 1;
+    }
+    char buf[4096];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        fputs(buf, stdout);
+    }
+    close(fd);
+    freeaddrinfo(res);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 2 && strcmp(argv[1], "--udp") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";
         const char *port = argc > 3 ? argv[3] : "3478";
         return udp_probe(host, port);
+    }
+    if (argc >= 2 && strcmp(argv[1], "--nonblock") == 0) {
+        const char *host = argc > 2 ? argv[2] : "example.com";
+        const char *port = argc > 3 ? argv[3] : "80";
+        return nonblock_probe(host, port);
     }
     if (argc >= 2 && strcmp(argv[1], "--dns") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";

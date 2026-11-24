@@ -60,6 +60,17 @@ export interface ExitIpInfo {
   isp: string;
 }
 
+export interface ConnectionRecord {
+  ts_ms: number;
+  protocol: string;
+  host: string;
+  port: number;
+  action: string;
+  rule: string;
+  result: string;
+  error: string;
+}
+
 export interface AppConfig {
   listen_host: string;
   socks5_port: number;
@@ -111,6 +122,8 @@ export const api = {
     invoke<void>("set_app_enabled", { id, enabled }),
   testUpstream: (id: string) => invoke<number>("test_upstream", { id }),
   probeExitIp: () => invoke<ExitIpInfo>("probe_exit_ip"),
+  listRecentConnections: (limit?: number) =>
+    invoke<ConnectionRecord[]>("list_recent_connections", { limit }),
   getConfig: () => invoke<AppConfig>("get_config"),
   saveConfig: (config: AppConfig) => invoke<void>("save_config", { config }),
   selectUpstream: (id: string) => invoke<void>("select_upstream", { id }),

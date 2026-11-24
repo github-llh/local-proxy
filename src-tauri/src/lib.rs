@@ -9,6 +9,7 @@ use tauri::Manager;
 
 mod autostart;
 mod commands;
+mod control_client;
 mod probe;
 mod state;
 mod tray;
@@ -52,6 +53,7 @@ pub fn run() {
             commands::set_app_enabled,
             commands::test_upstream,
             commands::probe_exit_ip,
+            commands::list_recent_connections,
             commands::get_config,
             commands::save_config,
             commands::get_launch_at_login,

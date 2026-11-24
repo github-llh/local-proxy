@@ -144,6 +144,10 @@ pub fn is_private_ipv4(ip: Ipv4Addr) -> bool {
 
 /// 私网 IPv6（fc00::/7 ULA、fe80::/10 链路本地、::1）。
 pub fn is_private_ipv6(ip: std::net::Ipv6Addr) -> bool {
+    // IPv4-mapped（::ffff:a.b.c.d）按 v4 语义判定（含回环 127.x）
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_private_ipv4(mapped);
+    }
     let seg = ip.segments();
     (seg[0] & 0xFE00) == 0xFC00 || (seg[0] & 0xFFC0) == 0xFE80 || ip.is_loopback()
 }

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use localproxy_core::config::AppConfig;
+use localproxy_core::control;
 use localproxy_core::server::{run_http, run_socks5, ServerContext};
 use tokio::net::TcpListener;
 
@@ -40,6 +41,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 启动前校验：防自环（上游指向自身监听端口）
     config.validate()?;
+
+    // 控制面 token：为空则生成并落盘（避免控制面无鉴权）
+    let mut config = config;
+    let token_changed = config.control_token.trim().is_empty();
+    config.ensure_control_token();
+    if token_changed {
+        if let Some(path) = &cli.config {
+            let path = std::path::Path::new(path);
+            if let Err(e) = config.save(path) {
+                tracing::warn!("保存生成的 control_token 失败: {e}");
+            }
+        }
+    }
     // 端口预检：与 Clash/V2RayN 等代理软件共存时给出友好错误
     config.check_ports_available()?;
 
@@ -47,18 +61,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socks5_port = config.socks5_port;
     let http_port = config.http_port;
 
+    let control_port = config.control_port;
     let ctx = Arc::new(ServerContext::new(config));
     tracing::info!("规则引擎: {}", ctx.rules.summary());
 
     // 监听
     let socks5_listener = TcpListener::bind((listen_host.as_str(), socks5_port)).await?;
     let http_listener = TcpListener::bind((listen_host.as_str(), http_port)).await?;
+    let control_listener = TcpListener::bind((listen_host.as_str(), control_port)).await?;
     tracing::info!(
-        "SOCKS5 监听 {}:{}，HTTP CONNECT 监听 {}:{}",
+        "SOCKS5 监听 {}:{}，HTTP CONNECT 监听 {}:{}，控制面监听 {}:{}",
         listen_host,
         socks5_port,
         listen_host,
-        http_port
+        http_port,
+        listen_host,
+        control_port
     );
 
     let socks5_task = {
@@ -68,6 +86,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_task = {
         let ctx = ctx.clone();
         tokio::spawn(async move { run_http(http_listener, ctx).await })
+    };
+    let control_task = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { control::run(control_listener, ctx).await })
     };
 
     // 等待退出信号或服务异常
@@ -83,6 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         result = http_task => {
             if let Ok(Err(e)) = result {
                 tracing::error!("HTTP 服务异常退出: {e}");
+            }
+        }
+        result = control_task => {
+            if let Ok(Err(e)) = result {
+                tracing::error!("控制面服务异常退出: {e}");
             }
         }
     }

@@ -15,6 +15,7 @@ use tokio::net::{TcpListener, TcpStream};
 use localproxy_net::socks5::{consts, reply_to_text, Timeouts};
 
 use crate::config::AppConfig;
+use crate::diagnostics::{self, ConnectionLog, ConnectionRecord};
 use crate::rules::{Action, RuleEngine};
 use crate::stats::Stats;
 use crate::upstream::{Upstream, UpstreamError};
@@ -27,6 +28,8 @@ pub struct ServerContext {
     pub rules: Arc<RuleEngine>,
     /// 统计
     pub stats: Arc<Stats>,
+    /// 连接诊断日志（环形缓冲）
+    pub connections: Arc<ConnectionLog>,
 }
 
 impl ServerContext {
@@ -37,7 +40,32 @@ impl ServerContext {
             config: Arc::new(tokio::sync::RwLock::new(config)),
             rules: Arc::new(rules),
             stats: Arc::new(Stats::new()),
+            connections: Arc::new(ConnectionLog::with_default_capacity()),
         }
+    }
+
+    /// 记录一条连接（诊断日志）。
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_connection(
+        &self,
+        protocol: &'static str,
+        host: &str,
+        port: u16,
+        action: &'static str,
+        rule: &str,
+        result: &'static str,
+        error: &str,
+    ) {
+        self.connections.record(ConnectionRecord {
+            ts_ms: diagnostics::now_ms(),
+            protocol: protocol.to_string(),
+            host: host.to_string(),
+            port,
+            action: action.to_string(),
+            rule: rule.to_string(),
+            result: result.to_string(),
+            error: error.to_string(),
+        });
     }
 
     /// 当前超时配置（M3 起从 config 的 timeout 节读取）。
@@ -250,6 +278,7 @@ async fn handle_socks5(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: A
                     format!(" rule={rule}")
                 }
             );
+            ctx.record_connection("tcp", &host, port, action.name(), &rule, "ok", "");
             relay(stream, upstream, ctx.stats.clone()).await;
         }
         Err(e) => {
@@ -260,6 +289,7 @@ async fn handle_socks5(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: A
                 rep,
                 reply_to_text(rep)
             );
+            ctx.record_connection("tcp", &host, port, "blocked", "", "failed", &e.to_string());
             let _ = send_socks5_reply(&mut stream, rep).await;
         }
     }
@@ -377,11 +407,13 @@ async fn handle_http(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: Arc
                     format!(" rule={rule}")
                 }
             );
+            ctx.record_connection("tcp", &host, port, action.name(), &rule, "ok", "");
             relay(stream, upstream, ctx.stats.clone()).await;
         }
         Err(e) => {
             ctx.stats.on_connect_failed();
             tracing::warn!("HTTP {peer} -> {host}:{port} 失败: {e}");
+            ctx.record_connection("tcp", &host, port, "blocked", "", "failed", &e.to_string());
             let body = format!("proxy error: {e}");
             let _ = stream
                 .write_all(
