@@ -368,3 +368,17 @@ select:focus {
   width: 14px;
   height: 14px;
 }
+
+/* 上游快切与应用增强 */
+.upstream-active {
+  background: var(--accent-soft);
+}
+
+.list-item.dimmed {
+  opacity: 0.55;
+}
+
+.list-item input[type="radio"] {
+  accent-color: var(--accent);
+  flex-shrink: 0;
+}

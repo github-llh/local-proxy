@@ -20,6 +20,7 @@ export interface AppEntry {
   enabled: boolean;
   extra_args: string[];
   note: string;
+  last_launched_at: number | null;
 }
 
 export interface SessionInfo {
@@ -94,6 +95,9 @@ export const api = {
   launchApp: (id: string) => invoke<SessionInfo>("launch_app", { id }),
   stopApp: (id: string) => invoke<void>("stop_app", { id }),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
+  setAppEnabled: (id: string, enabled: boolean) =>
+    invoke<void>("set_app_enabled", { id, enabled }),
+  testUpstream: (id: string) => invoke<number>("test_upstream", { id }),
   getConfig: () => invoke<AppConfig>("get_config"),
   saveConfig: (config: AppConfig) => invoke<void>("save_config", { config }),
   selectUpstream: (id: string) => invoke<void>("select_upstream", { id }),

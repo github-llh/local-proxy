@@ -48,6 +48,8 @@ pub fn run() {
             commands::launch_app,
             commands::stop_app,
             commands::list_sessions,
+            commands::set_app_enabled,
+            commands::test_upstream,
             commands::get_config,
             commands::save_config,
             commands::get_launch_at_login,

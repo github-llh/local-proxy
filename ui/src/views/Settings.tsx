@@ -32,6 +32,8 @@ export default function Settings() {
   const [apps, setApps] = useState<AppEntry[]>([]);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
@@ -66,6 +68,20 @@ export default function Settings() {
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
       setError(String(e));
+    }
+  };
+
+  const handleTestUpstream = async () => {
+    if (!config) return;
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const ms = await api.testUpstream(config.upstream.active);
+      setTestResult(`${ms} ms`);
+    } catch (e) {
+      setTestResult(String(e));
+    } finally {
+      setTesting(false);
     }
   };
 
@@ -245,6 +261,10 @@ export default function Settings() {
           </div>
         )}
         <div className="row-actions">
+          <button className="btn btn-small" onClick={handleTestUpstream} disabled={testing}>
+            {testing ? "…" : t("settings.testUpstream")}
+          </button>
+          {testResult && <span className="muted">{testResult}</span>}
           <button
             className="btn btn-small"
             onClick={() =>

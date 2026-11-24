@@ -24,6 +24,9 @@ pub struct AppEntry {
     /// 备注
     #[serde(default)]
     pub note: String,
+    /// 最近一次代理启动的 Unix 时间戳（秒；用于「最近使用」排序）
+    #[serde(default)]
+    pub last_launched_at: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -45,6 +48,7 @@ impl AppEntry {
             enabled: true,
             extra_args: Vec::new(),
             note: String::new(),
+            last_launched_at: None,
         })
     }
 
@@ -122,6 +126,7 @@ mod tests {
             enabled: true,
             extra_args: vec![],
             note: String::new(),
+            last_launched_at: None,
         };
         assert!(entry.is_macos_bundle());
         assert_eq!(

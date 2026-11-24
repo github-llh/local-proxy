@@ -191,7 +191,71 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
         .lock()
         .map_err(|e| e.to_string())?
         .push(session);
+
+    // 记录最近启动时间（「最近使用」排序）
+    {
+        let mut config = state.config.lock().map_err(|e| e.to_string())?;
+        if let Some(app) = config.apps.iter_mut().find(|a| a.id == id) {
+            app.last_launched_at = Some(now_unix_secs());
+        }
+    }
+    state.save_config()?;
     Ok(info)
+}
+
+/// 当前 Unix 时间戳（秒）。
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// 设置应用启用状态（popover 快速开关）。
+#[tauri::command]
+pub fn set_app_enabled(
+    state: State<'_, AppState>,
+    id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let app = config
+        .apps
+        .iter_mut()
+        .find(|a| a.id == id)
+        .ok_or_else(|| "应用不存在".to_string())?;
+    app.enabled = enabled;
+    drop(config);
+    state.save_config()
+}
+
+/// 测试上游连通性（TCP 连接延迟，毫秒）。
+///
+/// 轻量探测：对上游 host:port 建立 TCP 连接并计时；
+/// 不发送任何业务数据，不经过代理链。
+#[tauri::command]
+pub fn test_upstream(state: State<'_, AppState>, id: String) -> Result<u64, String> {
+    let (host, port) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
+        let server = config
+            .upstream
+            .servers
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| "上游不存在".to_string())?;
+        (server.host.clone(), server.port)
+    };
+    let start = std::time::Instant::now();
+    let connect = std::net::TcpStream::connect_timeout(
+        &format!("{host}:{port}")
+            .parse()
+            .map_err(|e| format!("地址无效: {e}"))?,
+        std::time::Duration::from_secs(5),
+    );
+    match connect {
+        Ok(_) => Ok(start.elapsed().as_millis() as u64),
+        Err(e) => Err(format!("连接失败: {e}")),
+    }
 }
 
 /// 平台启动分发（macOS：DYLD 注入；Windows：挂起进程 + DLL 注入）。

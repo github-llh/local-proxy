@@ -1,7 +1,14 @@
 // popover 视图：核心状态 + 上游切换 + 运行中应用 + 应用列表与快速启动。
 
-import { useCallback, useEffect, useState } from "react";
-import { api, pickAppFile, type AppEntry, type CoreStatus, type SessionInfo } from "../api";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  api,
+  pickAppFile,
+  type AppEntry,
+  type CoreStatus,
+  type SessionInfo,
+  type UpstreamServer,
+} from "../api";
 import { useT } from "../i18n";
 
 function formatUptime(secs: number): string {
@@ -17,13 +24,25 @@ export default function Popover() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [showUpstreams, setShowUpstreams] = useState(false);
+  const [upstreams, setUpstreams] = useState<UpstreamServer[]>([]);
+  const [activeUpstreamId, setActiveUpstreamId] = useState("");
+  const [latencies, setLatencies] = useState<Record<string, number>>({});
+  const [testingId, setTestingId] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const [s, a, sess] = await Promise.all([api.getStatus(), api.listApps(), api.listSessions()]);
+      const [s, a, sess, cfg] = await Promise.all([
+        api.getStatus(),
+        api.listApps(),
+        api.listSessions(),
+        api.getConfig(),
+      ]);
       setStatus(s);
       setApps(a);
       setSessions(sess);
+      setUpstreams(cfg.upstream.servers);
+      setActiveUpstreamId(cfg.upstream.active);
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -49,6 +68,30 @@ export default function Popover() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const activeLatency = activeUpstreamId ? latencies[activeUpstreamId] ?? null : null;
+
+  const handleSelectUpstream = async (id: string) => {
+    try {
+      await api.selectUpstream(id);
+      setActiveUpstreamId(id);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const handleTestUpstream = async (id: string) => {
+    setTestingId(id);
+    try {
+      const ms = await api.testUpstream(id);
+      setLatencies((prev) => ({ ...prev, [id]: ms }));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setTestingId(null);
     }
   };
 
@@ -95,6 +138,38 @@ export default function Popover() {
 
   const runningIds = new Set(sessions.map((s) => s.entry_id));
 
+  // 最近启动的排前面（无记录的按名称）
+  const sortedApps = useMemo(
+    () =>
+      [...apps].sort((a, b) => {
+        const la = a.last_launched_at ?? 0;
+        const lb = b.last_launched_at ?? 0;
+        if (lb !== la) return lb - la;
+        return a.name.localeCompare(b.name);
+      }),
+    [apps]
+  );
+
+  // 相对时间（刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期）
+  const formatRelative = (unixSecs: number): string => {
+    const now = Math.floor(Date.now() / 1000);
+    const diff = Math.max(0, now - unixSecs);
+    if (diff < 60) return t("time.justNow");
+    if (diff < 3600) return `${Math.floor(diff / 60)}${t("time.minutesAgo")}`;
+    if (diff < 86400) return `${Math.floor(diff / 3600)}${t("time.hoursAgo")}`;
+    if (diff < 86400 * 30) return `${Math.floor(diff / 86400)}${t("time.daysAgo")}`;
+    return new Date(unixSecs * 1000).toLocaleDateString();
+  };
+
+  const handleToggleEnabled = async (id: string, enabled: boolean) => {
+    try {
+      await api.setAppEnabled(id, enabled);
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   return (
     <main className="popover">
       <header className="popover-header">
@@ -133,6 +208,57 @@ export default function Popover() {
 
       <section className="section">
         <div className="section-head">
+          <h2>{t("popover.upstream")}</h2>
+          <button
+            className="btn btn-small btn-ghost"
+            onClick={() => setShowUpstreams((v) => !v)}
+          >
+            {showUpstreams ? t("popover.collapse") : t("popover.switch")}
+          </button>
+        </div>
+        <div className="list-item upstream-active">
+          <span className="item-name">
+            {status?.active_upstream || t("popover.notConfigured")}
+            {status?.upstream_type ? ` (${status.upstream_type})` : ""}
+          </span>
+          {activeLatency !== null && (
+            <span className="muted">{activeLatency} ms</span>
+          )}
+        </div>
+        {showUpstreams && (
+          <ul className="list">
+            {upstreams.map((u) => (
+              <li key={u.id} className="list-item">
+                <input
+                  type="radio"
+                  name="upstream"
+                  checked={u.id === activeUpstreamId}
+                  onChange={() => handleSelectUpstream(u.id)}
+                  title={t("popover.selectUpstream")}
+                />
+                <span className="item-name" title={`${u.host}:${u.port}`}>
+                  {u.name || u.id}
+                  <span className="muted">
+                    {" "}
+                    {u.type} · {u.host}:{u.port}
+                  </span>
+                </span>
+                <button
+                  className="btn btn-small btn-ghost"
+                  onClick={() => handleTestUpstream(u.id)}
+                  disabled={testingId === u.id}
+                  title={t("popover.testUpstream")}
+                >
+                  {testingId === u.id ? "…" : latencies[u.id] !== undefined ? `${latencies[u.id]}ms` : t("popover.test")}
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="section">
+        <div className="section-head">
           <h2>{t("popover.runningApps")}</h2>
           <span className="muted">{sessions.length}</span>
         </div>
@@ -164,10 +290,19 @@ export default function Popover() {
           <p className="muted">{t("popover.noApps")}</p>
         ) : (
           <ul className="list">
-            {apps.map((app) => (
-              <li key={app.id} className="list-item">
+            {sortedApps.map((app) => (
+              <li key={app.id} className={`list-item ${app.enabled ? "" : "dimmed"}`}>
+                <input
+                  type="checkbox"
+                  checked={app.enabled}
+                  onChange={(e) => handleToggleEnabled(app.id, e.target.checked)}
+                  title={t("popover.enableApp")}
+                />
                 <span className="item-name" title={app.path}>
                   {app.name}
+                  {app.last_launched_at ? (
+                    <span className="muted"> · {formatRelative(app.last_launched_at)}</span>
+                  ) : null}
                 </span>
                 {runningIds.has(app.id) ? (
                   <span className="badge">{t("popover.running")}</span>
@@ -175,7 +310,7 @@ export default function Popover() {
                   <button
                     className="btn btn-small btn-primary"
                     onClick={() => handleLaunch(app.id)}
-                    disabled={busy}
+                    disabled={busy || !app.enabled}
                   >
                     {t("popover.launch")}
                   </button>
