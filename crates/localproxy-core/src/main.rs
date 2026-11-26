@@ -6,10 +6,10 @@
 //! localproxy-core --config ./config.json   # 指定配置
 //! ```
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use clap::Parser;
-use localproxy_core::config::AppConfig;
+use localproxy_core::config::{AppConfig, DEFAULT_LISTEN_HOST};
 use localproxy_core::control;
 use localproxy_core::server::{run_http, run_socks5, ServerContext};
 use tokio::net::TcpListener;
@@ -20,7 +20,7 @@ use tokio::net::TcpListener;
 struct Cli {
     /// 配置文件路径（默认平台配置目录下的 config.json）
     #[arg(long)]
-    config: Option<String>,
+    config: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 加载配置
     let config = match &cli.config {
-        Some(path) => AppConfig::load(std::path::Path::new(path))?,
+        Some(path) => AppConfig::load(path)?,
         None => AppConfig::default(),
     };
 
@@ -48,7 +48,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.ensure_control_token();
     if token_changed {
         if let Some(path) = &cli.config {
-            let path = std::path::Path::new(path);
             if let Err(e) = config.save(path) {
                 tracing::warn!("保存生成的 control_token 失败: {e}");
             }
@@ -63,19 +62,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let control_port = config.control_port;
     let ctx = Arc::new(ServerContext::new(config));
-    tracing::info!("规则引擎: {}", ctx.rules.summary());
 
     // 监听
     let socks5_listener = TcpListener::bind((listen_host.as_str(), socks5_port)).await?;
     let http_listener = TcpListener::bind((listen_host.as_str(), http_port)).await?;
-    let control_listener = TcpListener::bind((listen_host.as_str(), control_port)).await?;
+    let control_listener = TcpListener::bind((DEFAULT_LISTEN_HOST, control_port)).await?;
     tracing::info!(
         "SOCKS5 监听 {}:{}，HTTP CONNECT 监听 {}:{}，控制面监听 {}:{}",
         listen_host,
         socks5_port,
         listen_host,
         http_port,
-        listen_host,
+        DEFAULT_LISTEN_HOST,
         control_port
     );
 
@@ -89,7 +87,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let control_task = {
         let ctx = ctx.clone();
-        tokio::spawn(async move { control::run(control_listener, ctx).await })
+        tokio::spawn(async move { control::run(control_listener, ctx, cli.config).await })
     };
 
     // 等待退出信号或服务异常

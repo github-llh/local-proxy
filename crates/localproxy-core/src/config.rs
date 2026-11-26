@@ -18,6 +18,7 @@ pub const DEFAULT_CONTROL_PORT: u16 = 1082;
 pub const DEFAULT_UPSTREAM_TYPE: &str = "socks5";
 pub const DEFAULT_UPSTREAM_HOST: &str = "127.0.0.1";
 pub const DEFAULT_UPSTREAM_PORT: u16 = 7890;
+pub const DEFAULT_CLASH_CONTROLLER: &str = "127.0.0.1:9090";
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 pub const DEFAULT_DNS_MODE: &str = "proxy";
 pub const DEFAULT_UDP_MODE: &str = "auto";
@@ -39,6 +40,8 @@ pub struct UpstreamServer {
     pub port: u16,
     pub username: String,
     pub password: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clash: Option<ClashController>,
 }
 
 impl Default for UpstreamServer {
@@ -51,14 +54,53 @@ impl Default for UpstreamServer {
             port: DEFAULT_UPSTREAM_PORT,
             username: String::new(),
             password: String::new(),
+            clash: None,
         }
+    }
+}
+
+/// 可选的 Clash/mihomo 控制面，代理流量仍使用上游的 host/port。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClashController {
+    pub address: String,
+    pub secret: String,
+}
+
+impl Default for ClashController {
+    fn default() -> Self {
+        Self {
+            address: DEFAULT_CLASH_CONTROLLER.to_string(),
+            secret: String::new(),
+        }
+    }
+}
+
+impl ClashController {
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, String> {
+        self.address
+            .trim()
+            .parse::<std::net::SocketAddr>()
+            .ok()
+            .filter(|addr| addr.ip().is_loopback() && addr.port() != 0)
+            .ok_or_else(|| {
+                "Clash 控制地址需要是本机回环 IP 和端口，例如 127.0.0.1:9090".to_string()
+            })
     }
 }
 
 impl UpstreamServer {
     /// 端点字符串 `host:port`。
     pub fn endpoint(&self) -> String {
-        format!("{}:{}", self.host, self.port)
+        socket_endpoint(&self.host, self.port)
+    }
+}
+
+fn socket_endpoint(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
     }
 }
 
@@ -322,13 +364,32 @@ impl AppConfig {
 
     /// 原子写入（临时文件 + rename）。
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
         }
         let text = self.to_json_pretty()?;
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(&tmp, &text).map_err(|e| format!("写临时配置失败: {e}"))?;
-        std::fs::rename(&tmp, path).map_err(|e| format!("替换配置失败: {e}"))
+        let tmp = path.with_extension(format!("{}.tmp", generate_token()));
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp)
+            .map_err(|e| format!("创建临时配置失败: {e}"))?;
+        let written = file.write_all(text.as_bytes());
+        drop(file);
+        let result = written
+            .map_err(|e| format!("写临时配置失败: {e}"))
+            .and_then(|()| std::fs::rename(&tmp, path).map_err(|e| format!("替换配置失败: {e}")));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result
     }
 
     /// 生成随机 control token（32 hex）。
@@ -521,12 +582,21 @@ impl AppConfig {
 
     /// SOCKS5 端点字符串。
     pub fn socks5_endpoint(&self) -> String {
-        format!("{}:{}", self.listen_host, self.socks5_port)
+        socket_endpoint(&self.listen_host, self.socks5_port)
     }
 
     /// 控制面端点字符串。
     pub fn control_endpoint(&self) -> String {
-        format!("{}:{}", self.listen_host, self.control_port)
+        format!("{DEFAULT_LISTEN_HOST}:{}", self.control_port)
+    }
+
+    /// 热重载沿用启动时的监听地址、端口和控制面认证配置。
+    pub fn use_running_listeners(&mut self, running: &Self) {
+        self.listen_host.clone_from(&running.listen_host);
+        self.socks5_port = running.socks5_port;
+        self.http_port = running.http_port;
+        self.control_port = running.control_port;
+        self.control_token.clone_from(&running.control_token);
     }
 
     /// 校验配置合法性（启动前调用）。
@@ -536,12 +606,12 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), String> {
         let self_ports = [self.socks5_port, self.http_port, self.control_port];
         for server in &self.upstream.servers {
-            let host = server.host.trim();
+            let host = server.host.trim().trim_matches(['[', ']']);
             let is_local = host.eq_ignore_ascii_case("localhost")
-                || host == "127.0.0.1"
-                || host.starts_with("127.")
-                || host == "::1"
-                || host == "[::1]";
+                || host == self.listen_host
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
             if is_local && self_ports.contains(&server.port) {
                 return Err(format!(
                     "上游 {}({}) 指向本核心监听端口 {}：会形成代理回环。\
@@ -549,11 +619,11 @@ impl AppConfig {
                     server.name, server.id, server.port
                 ));
             }
-        }
-        // 上游端口为 0（sanitize 已回退默认，双保险）
-        for server in &self.upstream.servers {
             if server.port == 0 {
                 return Err(format!("上游 {}({}) 端口为 0", server.name, server.id));
+            }
+            if let Some(clash) = &server.clash {
+                clash.socket_addr()?;
             }
         }
         Ok(())
@@ -561,12 +631,12 @@ impl AppConfig {
 
     /// 探测端口是否可绑定（启动前预检，给出友好错误）。
     pub fn check_ports_available(&self) -> Result<(), String> {
-        for (name, port) in [
-            ("SOCKS5", self.socks5_port),
-            ("HTTP CONNECT", self.http_port),
-            ("控制面", self.control_port),
+        for (name, host, port) in [
+            ("SOCKS5", self.listen_host.as_str(), self.socks5_port),
+            ("HTTP CONNECT", self.listen_host.as_str(), self.http_port),
+            ("控制面", DEFAULT_LISTEN_HOST, self.control_port),
         ] {
-            match std::net::TcpListener::bind((self.listen_host.as_str(), port)) {
+            match std::net::TcpListener::bind((host, port)) {
                 Ok(_) => {} // 立即 drop，仅探测
                 Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                     return Err(format!(

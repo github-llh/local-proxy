@@ -7,11 +7,14 @@
 
 use std::path::Path;
 
-use localproxy_core::config::AppConfig;
+use localproxy_core::config::{AppConfig, UpstreamServer};
 use localproxy_launcher::app_entry::AppEntry;
 use tauri::State;
 
-use crate::state::{core_running, kill_core, shim_binary_path, spawn_core, AppSession, AppState};
+use crate::clash::{ClashClient, ClashState};
+use crate::state::{
+    core_running, kill_core, running_core, shim_binary_path, spawn_core, AppSession, AppState,
+};
 
 /// 核心运行状态（popover 展示）。
 #[derive(serde::Serialize)]
@@ -19,10 +22,34 @@ pub struct CoreStatus {
     pub running: bool,
     pub pid: Option<u32>,
     pub uptime_secs: u64,
+    pub listen_host: String,
     pub socks5_port: u16,
     pub http_port: u16,
     pub active_upstream: String,
+    pub active_upstream_id: String,
     pub upstream_type: String,
+    pub upstreams: Vec<UpstreamSummary>,
+}
+
+#[derive(serde::Serialize)]
+pub struct UpstreamSummary {
+    id: String,
+    name: String,
+    endpoint: String,
+    server_type: String,
+    clash_enabled: bool,
+}
+
+impl From<&UpstreamServer> for UpstreamSummary {
+    fn from(server: &UpstreamServer) -> Self {
+        Self {
+            id: server.id.clone(),
+            name: server.name.clone(),
+            endpoint: server.endpoint(),
+            server_type: server.server_type.clone(),
+            clash_enabled: server.clash.is_some(),
+        }
+    }
 }
 
 /// 运行中应用会话（前端展示）。
@@ -38,25 +65,34 @@ pub struct SessionInfo {
 #[tauri::command]
 pub fn get_status(state: State<'_, AppState>) -> CoreStatus {
     let config = state.config.lock().unwrap();
-    let running = core_running(&state);
-    let (pid, uptime) = {
-        let guard = state.core.lock().unwrap();
-        match guard.as_ref() {
-            Some(core) if running => (Some(core.child.id()), core.started_at.elapsed().as_secs()),
-            _ => (None, 0),
-        }
-    };
+    let mut guard = state.core.lock().unwrap();
+    let core = running_core(&mut guard);
+    let listeners = core.map_or(&*config, |core| &core.startup_config);
     let upstream = config.upstream.active_server();
     CoreStatus {
-        running,
-        pid,
-        uptime_secs: uptime,
-        socks5_port: config.socks5_port,
-        http_port: config.http_port,
+        running: core.is_some(),
+        pid: core.map(|core| core.child.id()),
+        uptime_secs: core.map_or(0, |core| core.started_at.elapsed().as_secs()),
+        listen_host: listeners.listen_host.clone(),
+        socks5_port: listeners.socks5_port,
+        http_port: listeners.http_port,
         active_upstream: upstream
-            .map(|s| s.name.clone())
-            .unwrap_or_else(|| "未配置".to_string()),
+            .map(|s| {
+                if s.name.is_empty() {
+                    s.id.clone()
+                } else {
+                    s.name.clone()
+                }
+            })
+            .unwrap_or_default(),
+        active_upstream_id: upstream.map(|s| s.id.clone()).unwrap_or_default(),
         upstream_type: upstream.map(|s| s.server_type.clone()).unwrap_or_default(),
+        upstreams: config
+            .upstream
+            .servers
+            .iter()
+            .map(UpstreamSummary::from)
+            .collect(),
     }
 }
 
@@ -146,10 +182,12 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             .effective_udp_action(&upstream_type)
             .name()
             .to_string();
+        let mut guard = state.core.lock().map_err(|e| e.to_string())?;
+        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
         (
             entry,
-            config.listen_host.clone(),
-            config.socks5_port,
+            listeners.listen_host.clone(),
+            listeners.socks5_port,
             "198.18.0.0/15".to_string(),
             udp,
             config.proxy_rules.ipv6_mode.clone(),
@@ -208,8 +246,10 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
 pub fn probe_exit_ip(state: State<'_, AppState>) -> Result<crate::probe::ExitIpInfo, String> {
     let (core_endpoint, endpoints, timeout_ms) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
+        let mut guard = state.core.lock().map_err(|e| e.to_string())?;
+        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
         (
-            config.socks5_endpoint(),
+            listeners.socks5_endpoint(),
             config.probe.endpoints.clone(),
             config.probe.timeout_ms,
         )
@@ -225,7 +265,12 @@ pub fn list_recent_connections(
 ) -> Result<Vec<localproxy_core::diagnostics::ConnectionRecord>, String> {
     let (endpoint, token) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        (config.control_endpoint(), config.control_token.clone())
+        let mut guard = state.core.lock().map_err(|e| e.to_string())?;
+        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
+        (
+            listeners.control_endpoint(),
+            listeners.control_token.clone(),
+        )
     };
     let client = crate::control_client::ControlClient::new(endpoint, token);
     client
@@ -264,28 +309,38 @@ pub fn set_app_enabled(
 /// 轻量探测：对上游 host:port 建立 TCP 连接并计时；
 /// 不发送任何业务数据，不经过代理链。
 #[tauri::command]
-pub fn test_upstream(state: State<'_, AppState>, id: String) -> Result<u64, String> {
-    let (host, port) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        let server = config
+pub async fn test_upstream(
+    state: State<'_, AppState>,
+    id: String,
+    draft: Option<UpstreamServer>,
+) -> Result<u64, String> {
+    let server = match draft {
+        Some(server) => server,
+        None => state
+            .config
+            .lock()
+            .map_err(|e| e.to_string())?
             .upstream
             .servers
             .iter()
             .find(|s| s.id == id)
-            .ok_or_else(|| "上游不存在".to_string())?;
-        (server.host.clone(), server.port)
+            .cloned()
+            .ok_or_else(|| "上游不存在".to_string())?,
     };
+    let host = server
+        .host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
     let start = std::time::Instant::now();
-    let connect = std::net::TcpStream::connect_timeout(
-        &format!("{host}:{port}")
-            .parse()
-            .map_err(|e| format!("地址无效: {e}"))?,
+    tokio::time::timeout(
         std::time::Duration::from_secs(5),
-    );
-    match connect {
-        Ok(_) => Ok(start.elapsed().as_millis() as u64),
-        Err(e) => Err(format!("连接失败: {e}")),
-    }
+        tokio::net::TcpStream::connect((host, server.port)),
+    )
+    .await
+    .map_err(|_| "连接上游超时".to_string())?
+    .map_err(|e| format!("连接失败: {e}"))?;
+    Ok(start.elapsed().as_millis() as u64)
 }
 
 /// 平台启动分发（macOS：DYLD 注入；Windows：挂起进程 + DLL 注入）。
@@ -400,13 +455,25 @@ pub fn get_config(state: State<'_, AppState>) -> Result<AppConfig, String> {
 ///
 /// 若 `ui.launch_at_login` 与系统实际状态不一致，同步系统开机自启设置。
 #[tauri::command]
-pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), String> {
+pub fn save_config(
+    state: State<'_, AppState>,
+    mut config: AppConfig,
+    previous_active: Option<String>,
+) -> Result<AppConfig, String> {
     let launch_at_login = config.ui.launch_at_login;
     let mut current = state.config.lock().map_err(|e| e.to_string())?;
     let login_changed = current.ui.launch_at_login != launch_at_login;
-    *current = config;
-    drop(current);
-    state.save_config()?;
+    if previous_active.as_ref() == Some(&config.upstream.active)
+        && config
+            .upstream
+            .servers
+            .iter()
+            .any(|s| s.id == current.upstream.active)
+    {
+        config.upstream.active.clone_from(&current.upstream.active);
+    }
+    config.apps.clone_from(&current.apps);
+    state.apply_config(&mut current, config)?;
 
     if login_changed {
         let result = if launch_at_login {
@@ -415,13 +482,13 @@ pub fn save_config(state: State<'_, AppState>, config: AppConfig) -> Result<(), 
             crate::autostart::disable()
         };
         if let Err(e) = result {
-            // 自启设置失败不阻塞配置保存，回滚内存标记
-            let mut current = state.config.lock().map_err(|e| e.to_string())?;
+            // 自启设置失败时同步回滚内存和配置文件中的标记。
             current.ui.launch_at_login = !launch_at_login;
+            current.save(&state.config_path)?;
             return Err(format!("开机自启设置失败: {e}"));
         }
     }
-    Ok(())
+    Ok(current.clone())
 }
 
 /// 查询系统开机自启实际状态。
@@ -437,9 +504,43 @@ pub fn select_upstream(state: State<'_, AppState>, id: String) -> Result<(), Str
     if !config.upstream.servers.iter().any(|s| s.id == id) {
         return Err("上游不存在".to_string());
     }
-    config.upstream.active = id;
-    drop(config);
-    state.save_config()
+    let mut next = config.clone();
+    next.upstream.active = id;
+    state.apply_config(&mut config, next)
+}
+
+fn active_clash(state: &AppState, upstream_id: &str) -> Result<ClashClient, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let server = config
+        .upstream
+        .active_server()
+        .filter(|s| s.id == upstream_id)
+        .ok_or_else(|| "激活上游已变化，请刷新后重试".to_string())?;
+    let controller = server
+        .clash
+        .as_ref()
+        .ok_or_else(|| "当前上游尚未配置 Clash 控制地址".to_string())?;
+    ClashClient::new(controller)
+}
+
+#[tauri::command]
+pub async fn get_clash_state(
+    state: State<'_, AppState>,
+    upstream_id: String,
+) -> Result<ClashState, String> {
+    active_clash(&state, &upstream_id)?.snapshot().await
+}
+
+#[tauri::command]
+pub async fn select_clash_proxy(
+    state: State<'_, AppState>,
+    upstream_id: String,
+    group: String,
+    choice: String,
+) -> Result<(), String> {
+    active_clash(&state, &upstream_id)?
+        .select(&group, &choice)
+        .await
 }
 
 /// 清理已退出的会话（按 pid 存活判断）。

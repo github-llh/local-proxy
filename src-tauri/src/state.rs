@@ -6,10 +6,13 @@ use std::sync::Mutex;
 
 use localproxy_core::config::AppConfig;
 
+use crate::control_client::ControlClient;
+
 /// 核心进程句柄。
 pub struct CoreProcess {
     pub child: Child,
     pub started_at: std::time::Instant,
+    pub startup_config: AppConfig,
 }
 
 /// 一个被代理应用的运行会话。
@@ -60,6 +63,39 @@ impl AppState {
     pub fn save_config(&self) -> Result<(), String> {
         let config = self.config.lock().map_err(|e| e.to_string())?;
         config.save(&self.config_path)
+    }
+
+    /// 先落盘供核心重载，核心确认后更新应用配置。调用方持有配置锁。
+    pub fn apply_config(&self, current: &mut AppConfig, mut next: AppConfig) -> Result<(), String> {
+        next.sanitize();
+        next.ensure_control_token();
+        next.validate()?;
+        let mut core = self.core.lock().map_err(|e| e.to_string())?;
+        let running = running_core(&mut core).map(|core| &core.startup_config);
+        if let Some(running) = running {
+            let mut live = next.clone();
+            live.use_running_listeners(running);
+            live.validate()?;
+        }
+        next.save(&self.config_path)?;
+        if let Some(running) = running {
+            let client =
+                ControlClient::new(running.control_endpoint(), running.control_token.clone());
+            if let Err(e) = client.reload(&next.upstream.active) {
+                current.save(&self.config_path).map_err(|rollback| {
+                    format!("核心未确认配置: {e}。恢复配置文件失败: {rollback}")
+                })?;
+                // 超时也可能发生在核心应用配置后，恢复文件后再次同步运行态。
+                if let Err(rollback) = client.reload(&current.upstream.active) {
+                    return Err(format!(
+                        "核心未确认配置: {e}。已恢复配置文件，运行状态请重启核心同步: {rollback}"
+                    ));
+                }
+                return Err(format!("核心未应用配置，已恢复原配置: {e}"));
+            }
+        }
+        *current = next;
+        Ok(())
     }
 }
 
@@ -137,12 +173,10 @@ pub fn shim_binary_path() -> PathBuf {
 
 /// 启动本地核心子进程。
 pub fn spawn_core(state: &AppState) -> Result<u32, String> {
+    let config = state.config.lock().map_err(|e| e.to_string())?;
     let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-    if let Some(core) = guard.as_mut() {
-        // 已启动：检查存活
-        if matches!(core.child.try_wait(), Ok(None)) {
-            return Ok(core.child.id());
-        }
+    if let Some(core) = running_core(&mut guard) {
+        return Ok(core.child.id());
     }
 
     let binary = core_binary_path();
@@ -161,6 +195,7 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
     *guard = Some(CoreProcess {
         child,
         started_at: std::time::Instant::now(),
+        startup_config: config.clone(),
     });
     tracing::info!("核心已启动 pid={pid}");
     Ok(pid)
@@ -184,9 +219,15 @@ pub fn core_running(state: &AppState) -> bool {
         Ok(g) => g,
         Err(_) => return false,
     };
-    match guard.as_mut() {
-        Some(core) => matches!(core.child.try_wait(), Ok(None)),
-        None => false,
+    running_core(&mut guard).is_some()
+}
+
+pub fn running_core(core: &mut Option<CoreProcess>) -> Option<&CoreProcess> {
+    let core = core.as_mut()?;
+    if matches!(core.child.try_wait(), Ok(None)) {
+        Some(core)
+    } else {
+        None
     }
 }
 

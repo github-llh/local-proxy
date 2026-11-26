@@ -1,8 +1,8 @@
 // 设置窗口：端口 / 上游 / 路由规则 / DNS 与 UDP / 高级。
 
-import { useCallback, useEffect, useState } from "react";
-import { api, pickAppFile, type AppConfig, type AppEntry, type RoutingRule, type UpstreamServer } from "../api";
-import { useT } from "../i18n";
+import {useCallback, useEffect, useState} from "react";
+import {api, type AppConfig, type AppEntry, pickAppFile, type RoutingRule, type UpstreamServer} from "../api";
+import {useT} from "../i18n";
 
 const emptyUpstream: UpstreamServer = {
   id: "",
@@ -13,6 +13,8 @@ const emptyUpstream: UpstreamServer = {
   username: "",
   password: "",
 };
+
+const defaultClashController = {address: "127.0.0.1:9090", secret: ""};
 
 const emptyRule: RoutingRule = {
   name: "",
@@ -30,7 +32,9 @@ export default function Settings() {
   const t = useT();
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [apps, setApps] = useState<AppEntry[]>([]);
+  const [previousActive, setPreviousActive] = useState("");
   const [saved, setSaved] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
@@ -39,6 +43,7 @@ export default function Settings() {
     try {
       const [c, a] = await Promise.all([api.getConfig(), api.listApps()]);
       setConfig(c);
+      setPreviousActive(c.upstream.active);
       setApps(a);
       setError(null);
     } catch (e) {
@@ -62,21 +67,27 @@ export default function Settings() {
 
   const handleSave = async () => {
     if (!config) return;
+    setSaving(true);
+    setError(null);
     try {
-      await api.saveConfig(config);
+      const next = await api.saveConfig(config, previousActive);
+      setConfig((draft) => draft === config ? next : draft);
+      setPreviousActive(next.upstream.active);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSaving(false);
     }
   };
 
   const handleTestUpstream = async () => {
-    if (!config) return;
+    if (!activeUpstream) return;
     setTesting(true);
     setTestResult(null);
     try {
-      const ms = await api.testUpstream(config.upstream.active);
+      const ms = await api.testUpstream(activeUpstream.id, activeUpstream);
       setTestResult(`${ms} ms`);
     } catch (e) {
       setTestResult(String(e));
@@ -106,6 +117,14 @@ export default function Settings() {
 
   const activeUpstream =
     config.upstream.servers.find((s) => s.id === config.upstream.active) ?? config.upstream.servers[0];
+  const clashController = activeUpstream?.clash;
+
+  const patchUpstream = (edit: (server: UpstreamServer) => void) => {
+    patch((c) => {
+      const server = c.upstream.servers.find((s) => s.id === activeUpstream?.id);
+      if (server) edit(server);
+    });
+  };
 
   return (
     <main className="settings">
@@ -113,7 +132,7 @@ export default function Settings() {
         <h1>{t("settings.title")}</h1>
         <div className="header-actions">
           {saved && <span className="badge ok">{t("settings.saved")}</span>}
-          <button className="btn btn-primary" onClick={handleSave}>
+          <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
             {t("settings.save")}
           </button>
         </div>
@@ -260,6 +279,52 @@ export default function Settings() {
             </label>
           </div>
         )}
+        {activeUpstream && (
+          <>
+            <label className="checkbox">
+              <input
+                type="checkbox"
+                checked={clashController !== undefined}
+                onChange={(e) => patchUpstream((server) => {
+                  if (e.target.checked) {
+                    server.clash = {...defaultClashController};
+                  } else {
+                    delete server.clash;
+                  }
+                })}
+              />
+              {t("clash.enable")}
+            </label>
+            {clashController && (
+              <>
+                <div className="form-grid">
+                  <label>
+                    {t("clash.address")}
+                    <input
+                      value={clashController.address}
+                      onChange={(e) => {
+                        const clash = {...clashController, address: e.target.value};
+                        patchUpstream((server) => (server.clash = clash));
+                      }}
+                    />
+                  </label>
+                  <label>
+                    {t("clash.secret")}
+                    <input
+                      type="password"
+                      value={clashController.secret}
+                      onChange={(e) => {
+                        const clash = {...clashController, secret: e.target.value};
+                        patchUpstream((server) => (server.clash = clash));
+                      }}
+                    />
+                  </label>
+                </div>
+                <p className="muted">{t("clash.settingsHint")}</p>
+              </>
+            )}
+          </>
+        )}
         <div className="row-actions">
           <button className="btn btn-small" onClick={handleTestUpstream} disabled={testing}>
             {testing ? "…" : t("settings.testUpstream")}
@@ -270,7 +335,7 @@ export default function Settings() {
             onClick={() =>
               patch((c) => {
                 const id = `up-${Date.now().toString(36)}`;
-                c.upstream.servers.push({ ...emptyUpstream, id, name: `上游 ${c.upstream.servers.length + 1}` });
+                c.upstream.servers.push({...emptyUpstream, id, name: `上游 ${c.upstream.servers.length + 1}`});
                 c.upstream.active = id;
               })
             }
@@ -329,85 +394,85 @@ export default function Settings() {
         </label>
         <table className="rules-table">
           <thead>
-            <tr>
-              <th>{t("settings.enabled")}</th>
-              <th>{t("settings.name")}</th>
-              <th>{t("settings.action")}</th>
-              <th>{t("settings.domains")}</th>
-              <th>{t("settings.port")}</th>
-              <th></th>
-            </tr>
+          <tr>
+            <th>{t("settings.enabled")}</th>
+            <th>{t("settings.name")}</th>
+            <th>{t("settings.action")}</th>
+            <th>{t("settings.domains")}</th>
+            <th>{t("settings.port")}</th>
+            <th></th>
+          </tr>
           </thead>
           <tbody>
-            {config.routing.rules.map((rule, idx) => (
-              <tr key={idx}>
-                <td>
-                  <input
-                    type="checkbox"
-                    checked={rule.enabled}
-                    onChange={(e) =>
-                      patch((c) => (c.routing.rules[idx].enabled = e.target.checked))
-                    }
-                  />
-                </td>
-                <td>
-                  <input
-                    value={rule.name}
-                    onChange={(e) => patch((c) => (c.routing.rules[idx].name = e.target.value))}
-                  />
-                </td>
-                <td>
-                  <select
-                    value={rule.action}
-                    onChange={(e) => patch((c) => (c.routing.rules[idx].action = e.target.value))}
-                  >
-                    <option value="proxy">proxy</option>
-                    <option value="direct">direct</option>
-                  </select>
-                </td>
-                <td>
-                  <input
-                    placeholder=".cn, .example.com"
-                    value={rule.domains.join(", ")}
-                    onChange={(e) =>
-                      patch((c) => {
-                        c.routing.rules[idx].domains = e.target.value
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean);
-                      })
-                    }
-                  />
-                </td>
-                <td>
-                  <input
-                    placeholder="80, 443"
-                    value={rule.ports.join(", ")}
-                    onChange={(e) =>
-                      patch((c) => {
-                        c.routing.rules[idx].ports = e.target.value
-                          .split(",")
-                          .map((s) => s.trim())
-                          .filter(Boolean);
-                      })
-                    }
-                  />
-                </td>
-                <td>
-                  <button
-                    className="btn btn-small btn-ghost"
-                    onClick={() => patch((c) => c.routing.rules.splice(idx, 1))}
-                  >
-                    ×
-                  </button>
-                </td>
-              </tr>
-            ))}
+          {config.routing.rules.map((rule, idx) => (
+            <tr key={idx}>
+              <td>
+                <input
+                  type="checkbox"
+                  checked={rule.enabled}
+                  onChange={(e) =>
+                    patch((c) => (c.routing.rules[idx].enabled = e.target.checked))
+                  }
+                />
+              </td>
+              <td>
+                <input
+                  value={rule.name}
+                  onChange={(e) => patch((c) => (c.routing.rules[idx].name = e.target.value))}
+                />
+              </td>
+              <td>
+                <select
+                  value={rule.action}
+                  onChange={(e) => patch((c) => (c.routing.rules[idx].action = e.target.value))}
+                >
+                  <option value="proxy">proxy</option>
+                  <option value="direct">direct</option>
+                </select>
+              </td>
+              <td>
+                <input
+                  placeholder=".cn, .example.com"
+                  value={rule.domains.join(", ")}
+                  onChange={(e) =>
+                    patch((c) => {
+                      c.routing.rules[idx].domains = e.target.value
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                    })
+                  }
+                />
+              </td>
+              <td>
+                <input
+                  placeholder="80, 443"
+                  value={rule.ports.join(", ")}
+                  onChange={(e) =>
+                    patch((c) => {
+                      c.routing.rules[idx].ports = e.target.value
+                        .split(",")
+                        .map((s) => s.trim())
+                        .filter(Boolean);
+                    })
+                  }
+                />
+              </td>
+              <td>
+                <button
+                  className="btn btn-small btn-ghost"
+                  onClick={() => patch((c) => c.routing.rules.splice(idx, 1))}
+                >
+                  ×
+                </button>
+              </td>
+            </tr>
+          ))}
           </tbody>
         </table>
         <button
           className="btn btn-small"
-          onClick={() => patch((c) => c.routing.rules.push({ ...emptyRule }))}
+          onClick={() => patch((c) => c.routing.rules.push({...emptyRule}))}
         >
           {t("settings.addRule")}
         </button>

@@ -1,16 +1,37 @@
 // Tauri 命令层封装：前端唯一的数据入口。
 
-import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import {invoke} from "@tauri-apps/api/core";
+import {open as openDialog} from "@tauri-apps/plugin-dialog";
 
 export interface CoreStatus {
   running: boolean;
   pid: number | null;
   uptime_secs: number;
+  listen_host: string;
   socks5_port: number;
   http_port: number;
   active_upstream: string;
+  active_upstream_id: string;
   upstream_type: string;
+  upstreams: UpstreamSummary[];
+}
+
+export interface UpstreamSummary {
+  id: string;
+  name: string;
+  endpoint: string;
+  server_type: string;
+  clash_enabled: boolean;
+}
+
+export interface ClashController {
+  address: string;
+  secret: string;
+}
+
+export interface ClashState {
+  mode: string;
+  groups: { name: string; selected: string; choices: string[] }[];
 }
 
 export interface AppEntry {
@@ -38,6 +59,7 @@ export interface UpstreamServer {
   port: number;
   username: string;
   password: string;
+  clash?: ClashController;
 }
 
 export interface RoutingRule {
@@ -113,20 +135,24 @@ export const api = {
   startCore: () => invoke<number>("start_core"),
   stopCore: () => invoke<void>("stop_core"),
   listApps: () => invoke<AppEntry[]>("list_apps"),
-  addApp: (path: string) => invoke<AppEntry>("add_app", { path }),
-  removeApp: (id: string) => invoke<void>("remove_app", { id }),
-  launchApp: (id: string) => invoke<SessionInfo>("launch_app", { id }),
-  stopApp: (id: string) => invoke<void>("stop_app", { id }),
+  addApp: (path: string) => invoke<AppEntry>("add_app", {path}),
+  removeApp: (id: string) => invoke<void>("remove_app", {id}),
+  launchApp: (id: string) => invoke<SessionInfo>("launch_app", {id}),
+  stopApp: (id: string) => invoke<void>("stop_app", {id}),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   setAppEnabled: (id: string, enabled: boolean) =>
-    invoke<void>("set_app_enabled", { id, enabled }),
-  testUpstream: (id: string) => invoke<number>("test_upstream", { id }),
+    invoke<void>("set_app_enabled", {id, enabled}),
+  testUpstream: (id: string, draft?: UpstreamServer) => invoke<number>("test_upstream", {id, draft}),
   probeExitIp: () => invoke<ExitIpInfo>("probe_exit_ip"),
   listRecentConnections: (limit?: number) =>
-    invoke<ConnectionRecord[]>("list_recent_connections", { limit }),
+    invoke<ConnectionRecord[]>("list_recent_connections", {limit}),
   getConfig: () => invoke<AppConfig>("get_config"),
-  saveConfig: (config: AppConfig) => invoke<void>("save_config", { config }),
-  selectUpstream: (id: string) => invoke<void>("select_upstream", { id }),
+  saveConfig: (config: AppConfig, previousActive: string) =>
+    invoke<AppConfig>("save_config", {config, previousActive}),
+  selectUpstream: (id: string) => invoke<void>("select_upstream", {id}),
+  getClashState: (upstreamId: string) => invoke<ClashState>("get_clash_state", {upstreamId}),
+  selectClashProxy: (upstreamId: string, group: string, choice: string) =>
+    invoke<void>("select_clash_proxy", {upstreamId, group, choice}),
 };
 
 // 选择应用文件（.app / .exe / 可执行文件）。

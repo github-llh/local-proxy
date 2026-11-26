@@ -1,19 +1,19 @@
 // popover 视图：核心状态 + 上游切换 + 运行中应用 + 应用列表与快速启动。
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import {useCallback, useEffect, useMemo, useState} from "react";
 import {
   api,
-  pickAppFile,
   type AppEntry,
   type ConnectionRecord,
   type CoreStatus,
   type ExitIpInfo,
+  pickAppFile,
   type SessionInfo,
-  type UpstreamServer,
 } from "../api";
-import { useT } from "../i18n";
-import { checkConsistency, systemContext } from "../consistency";
-import { open } from "@tauri-apps/plugin-shell";
+import {useT} from "../i18n";
+import {checkConsistency, systemContext} from "../consistency";
+import {open} from "@tauri-apps/plugin-shell";
+import ClashSelection from "./ClashSelection";
 
 function formatUptime(secs: number): string {
   if (secs < 60) return `${secs}s`;
@@ -23,9 +23,9 @@ function formatUptime(secs: number): string {
 
 
 /// 一致性徽标（出口国家 vs 系统时区/语言）。
-function ConsistencyBadge({ countryCode }: { countryCode: string }) {
+function ConsistencyBadge({countryCode}: { countryCode: string }) {
   const t = useT();
-  const { timeZone, language } = systemContext();
+  const {timeZone, language} = systemContext();
   const result = checkConsistency(countryCode, timeZone, language);
   if (result.level === "ok") {
     return <p className="consistency ok">✅ {t("risk.consistent")}</p>;
@@ -48,8 +48,7 @@ export default function Popover() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [showUpstreams, setShowUpstreams] = useState(false);
-  const [upstreams, setUpstreams] = useState<UpstreamServer[]>([]);
-  const [activeUpstreamId, setActiveUpstreamId] = useState("");
+  const [switchingUpstream, setSwitchingUpstream] = useState(false);
   const [latencies, setLatencies] = useState<Record<string, number>>({});
   const [testingId, setTestingId] = useState<string | null>(null);
   const [exitIp, setExitIp] = useState<ExitIpInfo | null>(null);
@@ -59,18 +58,14 @@ export default function Popover() {
 
   const refresh = useCallback(async () => {
     try {
-      const [s, a, sess, cfg] = await Promise.all([
+      const [s, a, sess] = await Promise.all([
         api.getStatus(),
         api.listApps(),
         api.listSessions(),
-        api.getConfig(),
       ]);
       setStatus(s);
       setApps(a);
       setSessions(sess);
-      setUpstreams(cfg.upstream.servers);
-      setActiveUpstreamId(cfg.upstream.active);
-      setError(null);
     } catch (e) {
       setError(String(e));
     }
@@ -106,23 +101,31 @@ export default function Popover() {
     }
   };
 
-  const activeLatency = activeUpstreamId ? latencies[activeUpstreamId] ?? null : null;
+  const activeUpstreamId = status?.active_upstream_id ?? "";
+  const upstreams = status?.upstreams ?? [];
+  const clashEnabled = upstreams.some((u) => u.id === activeUpstreamId && u.clash_enabled);
+  const activeLatency = latencies[activeUpstreamId] ?? null;
 
   const handleSelectUpstream = async (id: string) => {
+    setSwitchingUpstream(true);
+    setError(null);
     try {
       await api.selectUpstream(id);
-      setActiveUpstreamId(id);
+      setExitIp(null);
       await refresh();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setSwitchingUpstream(false);
     }
   };
 
   const handleTestUpstream = async (id: string) => {
     setTestingId(id);
+    setError(null);
     try {
       const ms = await api.testUpstream(id);
-      setLatencies((prev) => ({ ...prev, [id]: ms }));
+      setLatencies((prev) => ({...prev, [id]: ms}));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -132,6 +135,7 @@ export default function Popover() {
 
   const handleProbe = async () => {
     setProbing(true);
+    setError(null);
     try {
       const info = await api.probeExitIp();
       setExitIp(info);
@@ -228,7 +232,7 @@ export default function Popover() {
   return (
     <main className="popover">
       <header className="popover-header">
-        <span className={`status-dot ${status?.running ? "on" : "off"}`} />
+        <span className={`status-dot ${status?.running ? "on" : "off"}`}/>
         <h1>{t("app.name")}</h1>
         <button
           className={`btn ${status?.running ? "btn-danger" : "btn-primary"}`}
@@ -255,11 +259,15 @@ export default function Popover() {
             {status?.upstream_type ? ` (${status.upstream_type})` : ""}
           </dd>
           <dt>{t("popover.socks5")}</dt>
-          <dd>127.0.0.1:{status?.socks5_port ?? "-"}</dd>
+          <dd>{status?.listen_host ?? "-"}:{status?.socks5_port ?? "-"}</dd>
           <dt>{t("popover.http")}</dt>
-          <dd>127.0.0.1:{status?.http_port ?? "-"}</dd>
+          <dd>{status?.listen_host ?? "-"}:{status?.http_port ?? "-"}</dd>
         </dl>
       </section>
+
+      {clashEnabled && (
+        <ClashSelection key={activeUpstreamId} upstreamId={activeUpstreamId} onChanged={() => setExitIp(null)}/>
+      )}
 
       <section className="section">
         <div className="section-head">
@@ -294,7 +302,7 @@ export default function Popover() {
                 </>
               )}
             </dl>
-            <ConsistencyBadge countryCode={exitIp.country_code} />
+            <ConsistencyBadge countryCode={exitIp.country_code}/>
           </div>
         ) : (
           <p className="muted">{t("risk.hint")}</p>
@@ -328,20 +336,21 @@ export default function Popover() {
                   type="radio"
                   name="upstream"
                   checked={u.id === activeUpstreamId}
+                  disabled={switchingUpstream || probing}
                   onChange={() => handleSelectUpstream(u.id)}
                   title={t("popover.selectUpstream")}
                 />
-                <span className="item-name" title={`${u.host}:${u.port}`}>
+                <span className="item-name" title={u.endpoint}>
                   {u.name || u.id}
                   <span className="muted">
                     {" "}
-                    {u.type} · {u.host}:{u.port}
+                    {u.server_type} · {u.endpoint}
                   </span>
                 </span>
                 <button
                   className="btn btn-small btn-ghost"
                   onClick={() => handleTestUpstream(u.id)}
-                  disabled={testingId === u.id}
+                  disabled={testingId !== null}
                   title={t("popover.testUpstream")}
                 >
                   {testingId === u.id ? "…" : latencies[u.id] !== undefined ? `${latencies[u.id]}ms` : t("popover.test")}
@@ -389,7 +398,7 @@ export default function Popover() {
               <ul className="list conn-list">
                 {connections.map((c, i) => (
                   <li key={`${c.ts_ms}-${i}`} className="list-item">
-                    <span className={`conn-dot ${c.action}`} />
+                    <span className={`conn-dot ${c.action}`}/>
                     <span className="item-name" title={`${c.host}:${c.port}${c.rule ? ` · ${c.rule}` : ""}`}>
                       {c.host}:{c.port}
                     </span>

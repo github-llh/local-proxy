@@ -4,10 +4,12 @@
 //! Bearer token 鉴权）。手写 HTTP/1.1（无第三方依赖）。
 
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use localproxy_core::diagnostics::ConnectionRecord;
+
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// 控制面客户端。
 pub struct ControlClient {
@@ -43,19 +45,23 @@ impl ControlClient {
         Self { endpoint, token }
     }
 
-    /// GET 请求（返回 status, body）。
-    fn get(&self, path: &str) -> Result<(u16, String), ControlError> {
-        let mut stream = TcpStream::connect(&self.endpoint)
+    fn request(&self, method: &str, path: &str) -> Result<(u16, String), ControlError> {
+        let endpoint: SocketAddr = self
+            .endpoint
+            .parse::<SocketAddr>()
+            .map_err(|e| ControlError::Unavailable(e.to_string()))?;
+        let mut stream = TcpStream::connect_timeout(&endpoint, CONTROL_TIMEOUT)
             .map_err(|e| ControlError::Unavailable(e.to_string()))?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
+            .set_read_timeout(Some(CONTROL_TIMEOUT))
+            .and_then(|_| stream.set_write_timeout(Some(CONTROL_TIMEOUT)))
             .map_err(|e| ControlError::Unavailable(e.to_string()))?;
 
-        let mut request = format!("GET {path} HTTP/1.1\r\nHost: {}\r\n", self.endpoint);
+        let mut request = format!("{method} {path} HTTP/1.1\r\nHost: {}\r\n", self.endpoint);
         if !self.token.trim().is_empty() {
             request.push_str(&format!("Authorization: Bearer {}\r\n", self.token.trim()));
         }
-        request.push_str("Connection: close\r\n\r\n");
+        request.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
         stream
             .write_all(request.as_bytes())
             .map_err(|e| ControlError::Unavailable(e.to_string()))?;
@@ -76,9 +82,30 @@ impl ControlClient {
         Ok((status, body))
     }
 
+    pub fn reload(&self, expected_upstream: &str) -> Result<(), ControlError> {
+        #[derive(serde::Deserialize)]
+        struct ReloadResponse {
+            reloaded: bool,
+            active_upstream: String,
+        }
+
+        let (status, body) = self.request("POST", "/v1/config/reload")?;
+        if status != 200 {
+            return Err(ControlError::Status(status, body));
+        }
+        let response: ReloadResponse = serde_json::from_str(&body)
+            .map_err(|_| ControlError::Parse("核心未确认生效的上游，请检查核心版本".to_string()))?;
+        if !response.reloaded || response.active_upstream != expected_upstream {
+            return Err(ControlError::Parse(
+                "核心返回的激活上游与配置不一致".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// 获取最近连接记录。
     pub fn connections(&self, limit: usize) -> Result<Vec<ConnectionRecord>, ControlError> {
-        let (status, body) = self.get(&format!("/v1/connections?limit={limit}"))?;
+        let (status, body) = self.request("GET", &format!("/v1/connections?limit={limit}"))?;
         if status != 200 {
             return Err(ControlError::Status(status, body));
         }
@@ -87,7 +114,7 @@ impl ControlClient {
 
     /// 获取统计快照 JSON。
     pub fn stats_json(&self) -> Result<String, ControlError> {
-        let (status, body) = self.get("/v1/stats")?;
+        let (status, body) = self.request("GET", "/v1/stats")?;
         if status != 200 {
             return Err(ControlError::Status(status, body));
         }
@@ -96,7 +123,7 @@ impl ControlClient {
 
     /// 健康检查。
     pub fn health(&self) -> bool {
-        matches!(self.get("/v1/health"), Ok((200, _)))
+        matches!(self.request("GET", "/v1/health"), Ok((200, _)))
     }
 }
 

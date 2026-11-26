@@ -8,6 +8,7 @@
 use tauri::Manager;
 
 mod autostart;
+mod clash;
 mod commands;
 mod control_client;
 mod probe;
@@ -58,6 +59,8 @@ pub fn run() {
             commands::save_config,
             commands::get_launch_at_login,
             commands::select_upstream,
+            commands::get_clash_state,
+            commands::select_clash_proxy,
         ])
         .run(tauri::generate_context!())
         .expect("启动 LocalProxy 失败");

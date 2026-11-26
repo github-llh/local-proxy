@@ -1,6 +1,6 @@
 // 轻量 i18n：词条 + useT hook（无第三方依赖）。
 
-import { createContext, useContext } from "react";
+import {createContext, useContext} from "react";
 
 export type Lang = "zh-CN" | "en";
 
@@ -43,6 +43,19 @@ const dict: Record<Lang, Record<string, string>> = {
     "popover.test": "测速",
     "popover.testUpstream": "测试上游延迟",
     "popover.enableApp": "启用该应用",
+    "clash.enable": "启用 Clash / mihomo 节点选择",
+    "clash.address": "控制地址",
+    "clash.secret": "控制 Secret（可选）",
+    "clash.settingsHint": "代理端口和控制地址应指向同一个 Clash 实例。保存后可在菜单栏面板切换节点。",
+    "clash.title": "Clash 节点",
+    "clash.refresh": "刷新",
+    "clash.group": "策略组",
+    "clash.node": "当前节点",
+    "clash.chooseNode": "选择节点",
+    "clash.noGroups": "当前配置没有可手动切换的策略组。",
+    "clash.mode.rule": "规则模式 · 仅影响命中该策略组的流量。",
+    "clash.mode.global": "全局模式 · 出口由 GLOBAL 策略组决定。",
+    "clash.mode.direct": "直连模式 · 请在 Clash 中切换为规则或全局模式。",
     "time.justNow": "刚刚",
     "time.minutesAgo": " 分钟前",
     "time.hoursAgo": " 小时前",
@@ -138,6 +151,19 @@ const dict: Record<Lang, Record<string, string>> = {
     "popover.test": "Test",
     "popover.testUpstream": "Test upstream latency",
     "popover.enableApp": "Enable this app",
+    "clash.enable": "Enable Clash / mihomo node selection",
+    "clash.address": "Controller address",
+    "clash.secret": "Controller secret (optional)",
+    "clash.settingsHint": "Use the proxy port and controller address for the same Clash instance. Save to switch nodes from the tray.",
+    "clash.title": "Clash nodes",
+    "clash.refresh": "Refresh",
+    "clash.group": "Policy group",
+    "clash.node": "Current node",
+    "clash.chooseNode": "Choose a node",
+    "clash.noGroups": "There are no manually selectable groups in this profile.",
+    "clash.mode.rule": "Rule mode · Applies to traffic routed to this policy group.",
+    "clash.mode.global": "Global mode · The GLOBAL policy group controls egress.",
+    "clash.mode.direct": "Direct mode · Switch Clash to rule or global mode to select a node.",
     "time.justNow": "just now",
     "time.minutesAgo": "m ago",
     "time.hoursAgo": "h ago",
@@ -210,6 +236,6 @@ export function useT(): (key: string) => string {
 }
 
 export const languages: { value: Lang; label: string }[] = [
-  { value: "zh-CN", label: "中文" },
-  { value: "en", label: "English" },
+  {value: "zh-CN", label: "中文"},
+  {value: "en", label: "English"},
 ];
