@@ -3,6 +3,8 @@
 import {useCallback, useEffect, useState} from "react";
 import {api, type AppConfig, type AppEntry, pickAppFile, type RoutingRule, type UpstreamServer} from "../api";
 import {useT} from "../i18n";
+import {open} from "@tauri-apps/plugin-dialog";
+import ManagedNodeEditor, {applyAdvancedOptions} from "./ManagedNodeEditor";
 
 const emptyUpstream: UpstreamServer = {
   id: "",
@@ -15,6 +17,16 @@ const emptyUpstream: UpstreamServer = {
 };
 
 const defaultClashController = {address: "127.0.0.1:9090", secret: ""};
+
+const upstreamPresets: Record<string, Partial<UpstreamServer>> = {
+  clash: {name: "Clash / mihomo", port: 7890},
+  v2rayn: {name: "v2rayN", port: 10808},
+  surge: {name: "Surge", port: 6153},
+  stash: {name: "Stash", port: 7890},
+  shadowsocks: {name: "Shadowsocks Windows", port: 1080},
+  socks5: {name: "SOCKS5"},
+  http: {name: "HTTP CONNECT", type: "http"},
+};
 
 const emptyRule: RoutingRule = {
   name: "",
@@ -38,6 +50,10 @@ export default function Settings() {
   const [error, setError] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState<string | null>(null);
+  const [preset, setPreset] = useState("clash");
+  const [nodeDrafts, setNodeDrafts] = useState<Record<string, string>>({});
+  const [engineResult, setEngineResult] = useState<string | null>(null);
+  const [checkingEngine, setCheckingEngine] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -65,12 +81,26 @@ export default function Settings() {
     setSaved(false);
   };
 
+  function withNodeDraft(server: UpstreamServer): UpstreamServer {
+    const draft = nodeDrafts[server.id];
+    if (server.managed && draft !== undefined) {
+      try {
+        return {...server, managed: applyAdvancedOptions(server.managed, draft)};
+      } catch {
+        throw new Error(`${server.name || server.id} · ${t("managed.invalidJson")}`);
+      }
+    }
+    return server;
+  }
+
   const handleSave = async () => {
     if (!config) return;
     setSaving(true);
     setError(null);
     try {
-      const next = await api.saveConfig(config, previousActive);
+      const snapshot = structuredClone(config);
+      snapshot.upstream.servers = snapshot.upstream.servers.map(withNodeDraft);
+      const next = await api.saveConfig(snapshot, previousActive);
       setConfig((draft) => draft === config ? next : draft);
       setPreviousActive(next.upstream.active);
       setSaved(true);
@@ -87,8 +117,8 @@ export default function Settings() {
     setTesting(true);
     setTestResult(null);
     try {
-      const ms = await api.testUpstream(activeUpstream.id, activeUpstream);
-      setTestResult(`${ms} ms`);
+      const result = await api.testUpstream(activeUpstream.id, withNodeDraft(activeUpstream), config?.mihomo_path);
+      setTestResult(result.kind === "port" ? `${result.elapsed_ms} ms` : t("managed.engineReady"));
     } catch (e) {
       setTestResult(String(e));
     } finally {
@@ -118,6 +148,42 @@ export default function Settings() {
   const activeUpstream =
     config.upstream.servers.find((s) => s.id === config.upstream.active) ?? config.upstream.servers[0];
   const clashController = activeUpstream?.clash;
+  const managed = activeUpstream?.managed;
+
+  function addUpstream(manual: boolean) {
+    const values: Partial<UpstreamServer> = manual
+      ? {name: t("managed.newNode"), host: "", port: 443, managed: {protocol: "vless", options: {}}}
+      : upstreamPresets[preset];
+    const upstream = {...emptyUpstream, ...structuredClone(values), id: crypto.randomUUID()};
+    setTestResult(null);
+    patch((c) => {
+      c.upstream.servers.push(upstream);
+      c.upstream.active = upstream.id;
+    });
+  }
+
+  async function chooseEngine() {
+    try {
+      const path = await open({multiple: false, directory: false, title: t("managed.chooseEngine")});
+      if (typeof path === "string") {
+        patch((c) => (c.mihomo_path = path));
+        setEngineResult(null);
+      }
+    } catch (e) {
+      setEngineResult(String(e));
+    }
+  }
+
+  async function checkEngine() {
+    setCheckingEngine(true);
+    try {
+      setEngineResult(await api.findMihomo(config?.mihomo_path ?? ""));
+    } catch (e) {
+      setEngineResult(String(e));
+    } finally {
+      setCheckingEngine(false);
+    }
+  }
 
   const patchUpstream = (edit: (server: UpstreamServer) => void) => {
     patch((c) => {
@@ -188,7 +254,10 @@ export default function Settings() {
             {t("settings.activeUpstream")}
             <select
               value={config.upstream.active}
-              onChange={(e) => patch((c) => (c.upstream.active = e.target.value))}
+              onChange={(e) => {
+                setTestResult(null);
+                patch((c) => (c.upstream.active = e.target.value));
+              }}
             >
               {config.upstream.servers.map((s) => (
                 <option key={s.id} value={s.id}>
@@ -212,21 +281,23 @@ export default function Settings() {
                 }
               />
             </label>
-            <label>
-              {t("settings.type")}
-              <select
-                value={activeUpstream.type}
-                onChange={(e) =>
-                  patch((c) => {
-                    const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
-                    if (s) s.type = e.target.value;
-                  })
-                }
-              >
-                <option value="socks5">socks5</option>
-                <option value="http">http</option>
-              </select>
-            </label>
+            {!managed && (
+              <label>
+                {t("settings.type")}
+                <select
+                  value={activeUpstream.type}
+                  onChange={(e) =>
+                    patch((c) => {
+                      const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
+                      if (s) s.type = e.target.value;
+                    })
+                  }
+                >
+                  <option value="socks5">socks5</option>
+                  <option value="http">http</option>
+                </select>
+              </label>
+            )}
             <label>
               {t("settings.host")}
               <input
@@ -252,34 +323,77 @@ export default function Settings() {
                 }
               />
             </label>
-            <label>
-              {t("settings.username")}
-              <input
-                value={activeUpstream.username}
-                onChange={(e) =>
-                  patch((c) => {
-                    const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
-                    if (s) s.username = e.target.value;
-                  })
-                }
-              />
-            </label>
-            <label>
-              {t("settings.password")}
-              <input
-                type="password"
-                value={activeUpstream.password}
-                onChange={(e) =>
-                  patch((c) => {
-                    const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
-                    if (s) s.password = e.target.value;
-                  })
-                }
-              />
-            </label>
+            {!managed && <>
+              <label>
+                {t("settings.username")}
+                <input
+                  value={activeUpstream.username}
+                  onChange={(e) =>
+                    patch((c) => {
+                      const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
+                      if (s) s.username = e.target.value;
+                    })
+                  }
+                />
+              </label>
+              <label>
+                {t("settings.password")}
+                <input
+                  type="password"
+                  value={activeUpstream.password}
+                  onChange={(e) =>
+                    patch((c) => {
+                      const s = c.upstream.servers.find((x) => x.id === activeUpstream.id);
+                      if (s) s.password = e.target.value;
+                    })
+                  }
+                />
+              </label>
+            </>}
           </div>
         )}
-        {activeUpstream && (
+        {activeUpstream && managed && (
+          <>
+            <ManagedNodeEditor
+              node={managed}
+              draft={nodeDrafts[activeUpstream.id]}
+              onNode={(node) => patchUpstream((server) => (server.managed = node))}
+              onDraft={(value) => {
+                setNodeDrafts((drafts) => {
+                  const next = {...drafts};
+                  if (value === undefined) {
+                    delete next[activeUpstream.id];
+                  } else {
+                    next[activeUpstream.id] = value;
+                  }
+                  return next;
+                });
+                setSaved(false);
+              }}
+            />
+            <div className="form-grid">
+              <label>
+                {t("managed.engine")}
+                <input
+                  value={config.mihomo_path}
+                  placeholder={t("managed.autoEngine")}
+                  onChange={(event) => {
+                    patch((c) => (c.mihomo_path = event.target.value));
+                    setEngineResult(null);
+                  }}
+                />
+              </label>
+            </div>
+            <div className="row-actions">
+              <button className="btn btn-small" onClick={chooseEngine}>{t("managed.chooseEngine")}</button>
+              <button className="btn btn-small" onClick={checkEngine} disabled={checkingEngine}>
+                {t("managed.checkEngine")}
+              </button>
+            </div>
+            {engineResult && <p className="muted" role="status">{engineResult}</p>}
+          </>
+        )}
+        {activeUpstream && !managed && (
           <>
             <label className="checkbox">
               <input
@@ -327,20 +441,20 @@ export default function Settings() {
         )}
         <div className="row-actions">
           <button className="btn btn-small" onClick={handleTestUpstream} disabled={testing}>
-            {testing ? "…" : t("settings.testUpstream")}
+            {testing ? "…" : t(managed ? "managed.testEngine" : "settings.testUpstream")}
           </button>
           {testResult && <span className="muted">{testResult}</span>}
-          <button
-            className="btn btn-small"
-            onClick={() =>
-              patch((c) => {
-                const id = `up-${Date.now().toString(36)}`;
-                c.upstream.servers.push({...emptyUpstream, id, name: `上游 ${c.upstream.servers.length + 1}`});
-                c.upstream.active = id;
-              })
-            }
-          >
+          <select aria-label={t("settings.upstreamPreset")} value={preset}
+                  onChange={(event) => setPreset(event.target.value)}>
+            {Object.entries(upstreamPresets).map(([key, profile]) =>
+              <option key={key} value={key}>{profile.name}</option>
+            )}
+          </select>
+          <button className="btn btn-small" onClick={() => addUpstream(false)}>
             {t("settings.addUpstream")}
+          </button>
+          <button className="btn btn-small" onClick={() => addUpstream(true)}>
+            {t("managed.add")}
           </button>
           {config.upstream.servers.length > 1 && (
             <button
@@ -566,14 +680,7 @@ export default function Settings() {
           />
           {t("settings.launchAtLogin")}
         </label>
-        <label className="checkbox">
-          <input
-            type="checkbox"
-            checked={config.ui.keep_core_alive}
-            onChange={(e) => patch((c) => (c.ui.keep_core_alive = e.target.checked))}
-          />
-          {t("settings.keepCoreAlive")}
-        </label>
+
         <label className="checkbox">
           <input
             type="checkbox"

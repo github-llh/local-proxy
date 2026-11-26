@@ -12,9 +12,7 @@ use localproxy_launcher::app_entry::AppEntry;
 use tauri::State;
 
 use crate::clash::{ClashClient, ClashState};
-use crate::state::{
-    core_running, kill_core, running_core, shim_binary_path, spawn_core, AppSession, AppState,
-};
+use crate::state::{kill_core, running_core, shim_binary_path, spawn_core, AppSession, AppState};
 
 /// 核心运行状态（popover 展示）。
 #[derive(serde::Serialize)]
@@ -28,6 +26,7 @@ pub struct CoreStatus {
     pub active_upstream: String,
     pub active_upstream_id: String,
     pub upstream_type: String,
+    pub exit_ip_probe_enabled: bool,
     pub upstreams: Vec<UpstreamSummary>,
 }
 
@@ -37,6 +36,7 @@ pub struct UpstreamSummary {
     name: String,
     endpoint: String,
     server_type: String,
+    managed: bool,
     clash_enabled: bool,
 }
 
@@ -46,10 +46,24 @@ impl From<&UpstreamServer> for UpstreamSummary {
             id: server.id.clone(),
             name: server.name.clone(),
             endpoint: server.endpoint(),
-            server_type: server.server_type.clone(),
+            server_type: display_protocol(server).to_string(),
+            managed: server.managed.is_some(),
             clash_enabled: server.clash.is_some(),
         }
     }
+}
+
+fn display_protocol(server: &UpstreamServer) -> &str {
+    server
+        .managed
+        .as_ref()
+        .map(|node| node.protocol.as_str())
+        .unwrap_or(&server.server_type)
+}
+
+#[tauri::command]
+pub fn find_mihomo(path: String) -> Result<String, String> {
+    localproxy_core::managed::mihomo_path(&path).map(|path| path.to_string_lossy().into_owned())
 }
 
 /// 运行中应用会话（前端展示）。
@@ -86,7 +100,11 @@ pub fn get_status(state: State<'_, AppState>) -> CoreStatus {
             })
             .unwrap_or_default(),
         active_upstream_id: upstream.map(|s| s.id.clone()).unwrap_or_default(),
-        upstream_type: upstream.map(|s| s.server_type.clone()).unwrap_or_default(),
+        upstream_type: upstream
+            .map(display_protocol)
+            .unwrap_or_default()
+            .to_string(),
+        exit_ip_probe_enabled: config.ui.exit_ip_probe,
         upstreams: config
             .upstream
             .servers
@@ -163,29 +181,32 @@ pub fn remove_app(state: State<'_, AppState>, id: String) -> Result<(), String> 
 pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo, String> {
     prune_sessions(&state);
 
-    let (entry, core_host, core_port, fakeip_cidr, udp_mode, ipv6_mode) = {
+    let entry = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
-        let entry = config
+        config
             .apps
             .iter()
-            .find(|a| a.id == id)
+            .find(|a| a.id == id && a.enabled)
             .cloned()
-            .ok_or_else(|| "应用不存在".to_string())?;
+            .ok_or_else(|| "应用不存在或已禁用".to_string())?
+    };
+    spawn_core(&state)?;
+    let (core_host, core_port, fakeip_cidr, udp_mode, ipv6_mode) = {
+        let config = state.config.lock().map_err(|e| e.to_string())?;
         // 安全策略由 core 配置解析：udp_mode × 上游类型 → 有效动作
         let upstream_type = config
             .upstream
             .active_server()
-            .map(|s| s.server_type.clone())
+            .map(UpstreamServer::udp_proxy_type)
             .unwrap_or_default();
         let udp = config
             .proxy_rules
-            .effective_udp_action(&upstream_type)
+            .effective_udp_action(upstream_type)
             .name()
             .to_string();
         let mut guard = state.core.lock().map_err(|e| e.to_string())?;
         let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
         (
-            entry,
             listeners.listen_host.clone(),
             listeners.socks5_port,
             "198.18.0.0/15".to_string(),
@@ -193,11 +214,6 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             config.proxy_rules.ipv6_mode.clone(),
         )
     };
-
-    // 核心必须在线（shim 拨号目标）
-    if !core_running(&state) {
-        spawn_core(&state)?;
-    }
 
     let shim = shim_binary_path();
     if !shim.exists() {
@@ -246,8 +262,13 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
 pub fn probe_exit_ip(state: State<'_, AppState>) -> Result<crate::probe::ExitIpInfo, String> {
     let (core_endpoint, endpoints, timeout_ms) = {
         let config = state.config.lock().map_err(|e| e.to_string())?;
+        if !config.ui.exit_ip_probe {
+            return Err("请先在设置中启用出口 IP 探测".to_string());
+        }
         let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
+        let listeners = &running_core(&mut guard)
+            .ok_or("LocalProxy 核心尚未运行")?
+            .startup_config;
         (
             listeners.socks5_endpoint(),
             config.probe.endpoints.clone(),
@@ -264,9 +285,10 @@ pub fn list_recent_connections(
     limit: Option<usize>,
 ) -> Result<Vec<localproxy_core::diagnostics::ConnectionRecord>, String> {
     let (endpoint, token) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
         let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
+        let listeners = &running_core(&mut guard)
+            .ok_or("LocalProxy 核心尚未运行")?
+            .startup_config;
         (
             listeners.control_endpoint(),
             listeners.control_token.clone(),
@@ -304,6 +326,13 @@ pub fn set_app_enabled(
     state.save_config()
 }
 
+#[derive(serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpstreamTest {
+    EngineReady,
+    Port { elapsed_ms: u64 },
+}
+
 /// 测试上游连通性（TCP 连接延迟，毫秒）。
 ///
 /// 轻量探测：对上游 host:port 建立 TCP 连接并计时；
@@ -313,7 +342,8 @@ pub async fn test_upstream(
     state: State<'_, AppState>,
     id: String,
     draft: Option<UpstreamServer>,
-) -> Result<u64, String> {
+    mihomo_path: Option<String>,
+) -> Result<UpstreamTest, String> {
     let server = match draft {
         Some(server) => server,
         None => state
@@ -327,6 +357,19 @@ pub async fn test_upstream(
             .cloned()
             .ok_or_else(|| "上游不存在".to_string())?,
     };
+    if server.managed.is_some() {
+        let path = match mihomo_path {
+            Some(path) => path,
+            None => state
+                .config
+                .lock()
+                .map_err(|e| e.to_string())?
+                .mihomo_path
+                .clone(),
+        };
+        localproxy_core::managed::ManagedRuntime::start(&server, &path).await?;
+        return Ok(UpstreamTest::EngineReady);
+    }
     let host = server
         .host
         .trim()
@@ -340,7 +383,9 @@ pub async fn test_upstream(
     .await
     .map_err(|_| "连接上游超时".to_string())?
     .map_err(|e| format!("连接失败: {e}"))?;
-    Ok(start.elapsed().as_millis() as u64)
+    Ok(UpstreamTest::Port {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    })
 }
 
 /// 平台启动分发（macOS：DYLD 注入；Windows：挂起进程 + DLL 注入）。
@@ -385,7 +430,6 @@ fn launch_via_platform(
     ipv6_mode: &str,
 ) -> Result<crate::state::AppSession, String> {
     use localproxy_launcher::windows;
-    use windows::Win32::System::Threading::GetProcessId;
 
     let session = windows::launch(
         entry,
@@ -397,7 +441,7 @@ fn launch_via_platform(
         ipv6_mode,
     )
     .map_err(|e| e.to_string())?;
-    let pid = unsafe { GetProcessId(session.process) };
+    let pid = session.pid();
     Ok(crate::state::AppSession {
         entry_id: session.entry_id,
         entry_name: entry.name.clone(),
@@ -557,7 +601,8 @@ fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: kill(pid, 0) 仅探测存在性
-        unsafe { libc::kill(pid as i32, 0) == 0 || *libc::__error() == libc::EPERM }
+        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+        alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
     #[cfg(windows)]
     {
@@ -571,7 +616,7 @@ fn pid_alive(pid: u32) -> bool {
             Ok(h) if !h.is_invalid() => {
                 let mut code = 0u32;
                 let ok = unsafe { GetExitCodeProcess(h, &mut code) };
-                unsafe { CloseHandle(h) };
+                let _ = unsafe { CloseHandle(h) };
                 // STILL_ACTIVE = 259
                 ok.is_ok() && code == 259
             }

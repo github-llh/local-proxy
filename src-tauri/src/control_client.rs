@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use localproxy_core::diagnostics::ConnectionRecord;
 
-const CONTROL_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// 控制面客户端。
 pub struct ControlClient {

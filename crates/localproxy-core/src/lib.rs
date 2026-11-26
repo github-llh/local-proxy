@@ -13,6 +13,7 @@ pub mod config;
 pub mod control;
 pub mod diagnostics;
 pub mod dns;
+pub mod managed;
 pub mod rules;
 pub mod server;
 pub mod stats;

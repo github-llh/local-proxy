@@ -5,6 +5,7 @@
 //! - Windows：`CreateProcessW(CREATE_SUSPENDED)` + 远程线程注入 shim DLL（两步初始化）
 
 pub mod app_entry;
+pub mod proxy_env;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

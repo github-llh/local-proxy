@@ -53,6 +53,7 @@ pub fn run() {
             commands::list_sessions,
             commands::set_app_enabled,
             commands::test_upstream,
+            commands::find_mihomo,
             commands::probe_exit_ip,
             commands::list_recent_connections,
             commands::get_config,

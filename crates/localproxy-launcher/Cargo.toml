@@ -8,3 +8,7 @@ description = "LocalProxy 平台启动器：macOS .app 解析/exec + DYLD 注入
 [dependencies]
 serde.workspace = true
 tracing.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+localproxy-inject.workspace = true
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

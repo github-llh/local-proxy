@@ -222,7 +222,7 @@ pub extern "C" fn localproxy_connect(
                 unsafe { set_errno(e.raw_os_error().unwrap_or(engine::ERR_NET_UNREACH)) };
                 -1
             }
-            // S2 落地前 engine 已将 Proxy 收敛为 Blocked；双保险
+            // 当前中继按 sendto 目标建会话；connected UDP 失败后由应用决定是否回退 TCP。
             engine::UdpOutcome::Proxy => {
                 unsafe { set_errno(engine::ERR_NET_UNREACH) };
                 -1
@@ -571,14 +571,19 @@ pub extern "C" fn localproxy_close(fd: RawFd) -> c_int {
 // ============= hook: getaddrinfo =============
 
 /// 构造指向 FakeIP 的 addrinfo 链表（单节点，AI_NUMERICHOST 之外的调用均可）。
-unsafe fn build_fake_addrinfo(ip: Ipv4Addr, port: u16) -> *mut libc::addrinfo {
+unsafe fn build_fake_addrinfo(
+    ip: Ipv4Addr,
+    port: u16,
+    socktype: c_int,
+    protocol: c_int,
+) -> *mut libc::addrinfo {
     let ai = libc::calloc(1, std::mem::size_of::<libc::addrinfo>()) as *mut libc::addrinfo;
     if ai.is_null() {
         return std::ptr::null_mut();
     }
     (*ai).ai_family = libc::AF_INET;
-    (*ai).ai_socktype = libc::SOCK_STREAM;
-    (*ai).ai_protocol = libc::IPPROTO_TCP;
+    (*ai).ai_socktype = socktype;
+    (*ai).ai_protocol = protocol;
     (*ai).ai_flags = 0;
     (*ai).ai_next = std::ptr::null_mut();
     (*ai).ai_canonname = std::ptr::null_mut();
@@ -624,14 +629,26 @@ pub extern "C" fn localproxy_getaddrinfo(
         return unsafe { getaddrinfo(node, service, hints, res) };
     }
 
-    // hints 要求 AI_NUMERICHOST / AI_PASSIVE 等场景不代理
-    if !hints.is_null() {
-        // SAFETY: hints 有效
-        let h = unsafe { &*hints };
-        if h.ai_flags & libc::AI_NUMERICHOST != 0 || h.ai_flags & libc::AI_PASSIVE != 0 {
-            return unsafe { getaddrinfo(node, service, hints, res) };
+    // 公网名称不能降级给系统解析器，同时保留调用方请求的传输类型。
+    let (socktype, protocol) = if hints.is_null() {
+        (libc::SOCK_STREAM, libc::IPPROTO_TCP)
+    } else {
+        let hints = unsafe { &*hints };
+        if hints.ai_flags & libc::AI_NUMERICHOST != 0 || hints.ai_family == libc::AF_INET6 {
+            return libc::EAI_NONAME;
         }
-    }
+        let socktype = match (hints.ai_socktype, hints.ai_protocol) {
+            (0, libc::IPPROTO_UDP) => libc::SOCK_DGRAM,
+            (0, _) => libc::SOCK_STREAM,
+            (kind, _) => kind,
+        };
+        let protocol = match (socktype, hints.ai_protocol) {
+            (libc::SOCK_DGRAM, 0) => libc::IPPROTO_UDP,
+            (libc::SOCK_STREAM, 0) => libc::IPPROTO_TCP,
+            (_, protocol) => protocol,
+        };
+        (socktype, protocol)
+    };
 
     // service → 端口
     let service_str = if service.is_null() {
@@ -645,12 +662,12 @@ pub extern "C" fn localproxy_getaddrinfo(
     // 分配 FakeIP 并记录映射
     let ip_u32 = match engine::fakeip_lock().assign(node_str) {
         Some(ip) => ip,
-        None => return unsafe { getaddrinfo(node, service, hints, res) },
+        None => return libc::EAI_FAIL,
     };
     let fake_ip = Ipv4Addr::from(ip_u32);
 
     // SAFETY: 构造标准 addrinfo 单节点链表，可被 freeaddrinfo 释放
-    let ai = unsafe { build_fake_addrinfo(fake_ip, port) };
+    let ai = unsafe { build_fake_addrinfo(fake_ip, port, socktype, protocol) };
     if ai.is_null() {
         return libc::EAI_MEMORY;
     }
@@ -726,11 +743,9 @@ pub extern "C" fn localproxy_gethostbyname(name: *const c_char) -> *mut libc::ho
     if !engine::should_fakeip(host) {
         return unsafe { gethostbyname(name) };
     }
-    match engine::fakeip_assign(host) {
-        Some(ip) => unsafe { build_fake_hostent(host, ip.to_be_bytes()) }
-            .unwrap_or_else(|| unsafe { gethostbyname(name) }),
-        None => unsafe { gethostbyname(name) },
-    }
+    engine::fakeip_assign(host)
+        .and_then(|ip| unsafe { build_fake_hostent(host, ip.to_be_bytes()) })
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `gethostbyname2` 替换实现：仅处理 AF_INET。
@@ -741,7 +756,7 @@ pub extern "C" fn localproxy_gethostbyname2(name: *const c_char, af: c_int) -> *
     let Some(_guard) = engine::HookGuard::enter() else {
         return unsafe { gethostbyname2(name, af) };
     };
-    if af != 2 || name.is_null() {
+    if name.is_null() {
         return unsafe { gethostbyname2(name, af) };
     }
     // SAFETY: name 为 NUL 结尾字符串
@@ -751,11 +766,12 @@ pub extern "C" fn localproxy_gethostbyname2(name: *const c_char, af: c_int) -> *
     if !engine::should_fakeip(host) {
         return unsafe { gethostbyname2(name, af) };
     }
-    match engine::fakeip_assign(host) {
-        Some(ip) => unsafe { build_fake_hostent(host, ip.to_be_bytes()) }
-            .unwrap_or_else(|| unsafe { gethostbyname2(name, af) }),
-        None => unsafe { gethostbyname2(name, af) },
+    if af != libc::AF_INET {
+        return std::ptr::null_mut();
     }
+    engine::fakeip_assign(host)
+        .and_then(|ip| unsafe { build_fake_hostent(host, ip.to_be_bytes()) })
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `getnameinfo` 替换实现：反查 FakeIP → 返回映射域名（消除 198.18.x.x 字面量暴露）。
@@ -775,7 +791,7 @@ pub extern "C" fn localproxy_getnameinfo(
         return unsafe { getnameinfo(sa, salen, host, hostlen, serv, servlen, flags) };
     };
 
-    // 解析地址；非 FakeIP → 原函数
+    // 私网保留系统反查，公网地址不触发系统 PTR 请求。
     // SAFETY: 调用方保证 sa/salen 有效
     let target = unsafe { parse_sockaddr(sa, salen) };
     let fake_domain = match &target {
@@ -790,6 +806,18 @@ pub extern "C" fn localproxy_getnameinfo(
         _ => None,
     };
     let Some(domain) = fake_domain else {
+        let flags = if !host.is_null()
+            && target
+                .as_ref()
+                .is_some_and(|addr| !engine::should_bypass(addr))
+        {
+            if flags & NI_NAMEREQD != 0 && flags & NI_NUMERICHOST == 0 {
+                return libc::EAI_NONAME;
+            }
+            flags | NI_NUMERICHOST
+        } else {
+            flags
+        };
         return unsafe { getnameinfo(sa, salen, host, hostlen, serv, servlen, flags) };
     };
     // NI_NUMERICHOST 明确要数字形式：放行原函数

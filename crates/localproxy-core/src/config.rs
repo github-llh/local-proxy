@@ -42,6 +42,8 @@ pub struct UpstreamServer {
     pub password: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clash: Option<ClashController>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<crate::managed::ManagedNode>,
 }
 
 impl Default for UpstreamServer {
@@ -55,6 +57,7 @@ impl Default for UpstreamServer {
             username: String::new(),
             password: String::new(),
             clash: None,
+            managed: None,
         }
     }
 }
@@ -90,6 +93,18 @@ impl ClashController {
 }
 
 impl UpstreamServer {
+    pub fn udp_proxy_type(&self) -> &str {
+        if self
+            .managed
+            .as_ref()
+            .is_some_and(|node| !node.supports_udp())
+        {
+            "tcp-only"
+        } else {
+            &self.server_type
+        }
+    }
+
     /// 端点字符串 `host:port`。
     pub fn endpoint(&self) -> String {
         socket_endpoint(&self.host, self.port)
@@ -299,6 +314,15 @@ impl Default for UiSettings {
 
 // ============= 顶层 =============
 
+/// 桌面程序使用核心实际绑定的地址启动被代理应用。
+#[derive(Serialize, Deserialize)]
+pub struct ListenerInfo {
+    pub listen_host: String,
+    pub socks5_port: u16,
+    pub http_port: u16,
+    pub control_port: u16,
+}
+
 /// 完整配置文件模型（`config.json`）。
 ///
 /// 端口等字段使用宽松反序列化：越界/类型不符时回退默认，
@@ -312,6 +336,7 @@ pub struct AppConfig {
     pub control_port: u16,
     pub control_token: String,
     pub log_level: String,
+    pub mihomo_path: String,
     pub upstream: UpstreamSettings,
     pub routing: RoutingSettings,
     pub dns_mode: String,
@@ -330,6 +355,7 @@ impl Default for AppConfig {
             control_port: DEFAULT_CONTROL_PORT,
             control_token: String::new(),
             log_level: DEFAULT_LOG_LEVEL.to_string(),
+            mihomo_path: String::new(),
             upstream: UpstreamSettings::default(),
             routing: RoutingSettings::default(),
             dns_mode: DEFAULT_DNS_MODE.to_string(),
@@ -472,10 +498,10 @@ impl AppConfig {
                 ));
                 server.server_type = DEFAULT_UPSTREAM_TYPE.to_string();
             }
-            if server.host.trim().is_empty() {
+            if server.managed.is_none() && server.host.trim().is_empty() {
                 server.host = DEFAULT_UPSTREAM_HOST.to_string();
             }
-            if server.port == 0 {
+            if server.managed.is_none() && server.port == 0 {
                 server.port = DEFAULT_UPSTREAM_PORT;
             }
         }
@@ -599,11 +625,44 @@ impl AppConfig {
         self.control_token.clone_from(&running.control_token);
     }
 
+    pub fn validate_desktop(&self) -> Result<(), String> {
+        let mut config = self.clone();
+        // 首选端口可以与已配置外部代理重合，桌面核心启动时会选择空闲端口。
+        config.socks5_port = 0;
+        config.http_port = 0;
+        config.control_port = 0;
+        config.validate()
+    }
+
+    pub fn listener_info(&self) -> ListenerInfo {
+        ListenerInfo {
+            listen_host: self.listen_host.clone(),
+            socks5_port: self.socks5_port,
+            http_port: self.http_port,
+            control_port: self.control_port,
+        }
+    }
+
+    pub fn set_listener_info(&mut self, info: ListenerInfo) {
+        self.listen_host = info.listen_host;
+        self.socks5_port = info.socks5_port;
+        self.http_port = info.http_port;
+        self.control_port = info.control_port;
+    }
+
     /// 校验配置合法性（启动前调用）。
     ///
     /// 重点：**防自环**——上游指向本核心的监听端口（如把 Clash 的上游配成
     /// 自己的 1080，或链式代理配反）会形成无限回环，必须拒绝启动。
     pub fn validate(&self) -> Result<(), String> {
+        let host = self.listen_host.trim();
+        if !host.eq_ignore_ascii_case("localhost")
+            && !host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+        {
+            return Err("LocalProxy 监听地址必须为本机回环 IP 或 localhost".to_string());
+        }
         let self_ports = [self.socks5_port, self.http_port, self.control_port];
         for server in &self.upstream.servers {
             let host = server.host.trim().trim_matches(['[', ']']);
@@ -624,6 +683,15 @@ impl AppConfig {
             }
             if let Some(clash) = &server.clash {
                 clash.socket_addr()?;
+            }
+            if let Some(node) = &server.managed {
+                if server.host.trim().is_empty()
+                    || server.clash.is_some()
+                    || server.server_type != "socks5"
+                {
+                    return Err("独立节点需要服务器地址，并使用本地 SOCKS5 转发".to_string());
+                }
+                node.validate()?;
             }
         }
         Ok(())

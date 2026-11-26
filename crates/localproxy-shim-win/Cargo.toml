@@ -18,12 +18,14 @@ localproxy-net = { workspace = true }
 localproxy-inject = { workspace = true }
 tracing.workspace = true
 minhook = "0.1"
+windows = { version = "0.61", features = ["Win32_Foundation"] }
 windows-sys = { version = "0.59", features = [
-  "Win32_Foundation",
-  "Win32_Networking_WinSock",
-  "Win32_Security",
-  "Win32_System_LibraryLoader",
-  "Win32_System_Memory",
-  "Win32_System_Threading",
-  "Win32_System_Diagnostics_Debug",
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_IO",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
 ] }

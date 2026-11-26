@@ -1,10 +1,12 @@
 //! 应用共享状态：配置、核心子进程、被代理应用会话。
 
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use localproxy_core::config::AppConfig;
+use localproxy_core::config::{AppConfig, ListenerInfo};
 
 use crate::control_client::ControlClient;
 
@@ -69,7 +71,7 @@ impl AppState {
     pub fn apply_config(&self, current: &mut AppConfig, mut next: AppConfig) -> Result<(), String> {
         next.sanitize();
         next.ensure_control_token();
-        next.validate()?;
+        next.validate_desktop()?;
         let mut core = self.core.lock().map_err(|e| e.to_string())?;
         let running = running_core(&mut core).map(|core| &core.startup_config);
         if let Some(running) = running {
@@ -120,6 +122,11 @@ pub fn default_config_path() -> PathBuf {
 /// - dev（debug_assertions）：workspace target/debug/localproxy-core
 /// - release：与 App 可执行文件同目录（打包时 sidecar 放置处）
 pub fn core_binary_path() -> PathBuf {
+    let name = if cfg!(windows) {
+        "localproxy-core.exe"
+    } else {
+        "localproxy-core"
+    };
     if cfg!(debug_assertions) {
         // 仓库根/target/debug/localproxy-core
         let exe = std::env::current_exe().unwrap_or_default();
@@ -129,10 +136,10 @@ pub fn core_binary_path() -> PathBuf {
             .nth(3)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("."));
-        root.join("target/debug/localproxy-core")
+        root.join("target/debug").join(name)
     } else {
         let exe = std::env::current_exe().unwrap_or_default();
-        exe.with_file_name("localproxy-core")
+        exe.with_file_name(name)
     }
 }
 
@@ -184,18 +191,60 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
         return Err(format!("核心二进制不存在: {}", binary.display()));
     }
 
-    let child = std::process::Command::new(&binary)
+    let mut command = std::process::Command::new(&binary);
+    localproxy_launcher::proxy_env::remove_from(&mut command);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        command.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .arg("--config")
         .arg(&state.config_path)
-        .stdout(std::process::Stdio::null())
+        .arg("--desktop")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("启动核心失败: {e}"))?;
+    let stdout = child.stdout.take().expect("核心 stdout 已配置");
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum Startup {
+            Ready(ListenerInfo),
+            Failed { error: String },
+        }
+        let info = BufReader::new(stdout)
+            .read_line(&mut line)
+            .ok()
+            .and_then(|_| serde_json::from_str::<Startup>(&line).ok())
+            .map(|startup| match startup {
+                Startup::Ready(info) => Ok(info),
+                Startup::Failed { error } => Err(error),
+            });
+        let _ = send.send(info);
+    });
+    let info = match receive.recv_timeout(Duration::from_secs(7)) {
+        Ok(Some(Ok(info))) => info,
+        Ok(Some(Err(error))) => {
+            let _ = stop_child(&mut child);
+            return Err(error);
+        }
+        _ => {
+            let _ = stop_child(&mut child);
+            return Err("代理核心未能就绪，请检查监听配置、活动节点和内核版本".to_string());
+        }
+    };
+    let mut startup_config = config.clone();
+    startup_config.set_listener_info(info);
     let pid = child.id();
     *guard = Some(CoreProcess {
         child,
         started_at: std::time::Instant::now(),
-        startup_config: config.clone(),
+        startup_config,
     });
     tracing::info!("核心已启动 pid={pid}");
     Ok(pid)
@@ -205,21 +254,25 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
 pub fn kill_core(state: &AppState) -> Result<(), String> {
     let mut guard = state.core.lock().map_err(|e| e.to_string())?;
     if let Some(mut core) = guard.take() {
-        core.child
-            .kill()
-            .map_err(|e| format!("停止核心失败: {e}"))?;
+        stop_child(&mut core.child).map_err(|e| format!("停止核心失败: {e}"))?;
         tracing::info!("核心已停止");
     }
     Ok(())
 }
 
-/// 核心是否在运行。
-pub fn core_running(state: &AppState) -> bool {
-    let mut guard = match state.core.lock() {
-        Ok(g) => g,
-        Err(_) => return false,
-    };
-    running_core(&mut guard).is_some()
+fn stop_child(child: &mut Child) -> std::io::Result<()> {
+    // 先关闭父子进程管道，让核心回收独立内核和临时配置。
+    drop(child.stdin.take());
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while child.try_wait()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            break;
+        }
+        std::thread::park_timeout(Duration::from_millis(20));
+    }
+    Ok(())
 }
 
 pub fn running_core(core: &mut Option<CoreProcess>) -> Option<&CoreProcess> {

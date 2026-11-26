@@ -10,8 +10,6 @@
 //! 限制：对 PPL（受保护轻量进程）与拦截注入的安全软件无效，
 //! 调用方会收到明确错误。
 
-use std::ffi::OsStr;
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use localproxy_inject::{
@@ -69,24 +67,6 @@ impl From<InjectError> for LaunchError {
     }
 }
 
-/// 需要清理的代理环境变量（大小写组合）。
-///
-/// Clash/V2RayN 等会设置系统代理与这些环境变量；若不清理，被注入应用会把
-/// 连接发往代理软件的系统代理端口（双跳且行为不可预期）。清理后应用处于
-/// 「无代理」环境，由 shim 全权接管。
-const PROXY_ENV_VARS: [&str; 10] = [
-    "http_proxy",
-    "HTTP_PROXY",
-    "https_proxy",
-    "HTTPS_PROXY",
-    "all_proxy",
-    "ALL_PROXY",
-    "ftp_proxy",
-    "FTP_PROXY",
-    "no_proxy",
-    "NO_PROXY",
-];
-
 /// 以代理模式启动应用（注入 shim DLL）。
 ///
 /// - `shim_path`：shim DLL 绝对路径
@@ -115,7 +95,7 @@ pub fn launch(
 
     // 环境变量（继承当前环境 + LP_* 注入配置，清理系统代理变量）
     let mut env_pairs: Vec<(String, String)> = std::env::vars()
-        .filter(|(k, _)| !PROXY_ENV_VARS.contains(&k.as_str()))
+        .filter(|(k, _)| !crate::proxy_env::is_proxy_var(k))
         .collect();
     env_pairs.push(("LP_CORE_HOST".into(), core_host.into()));
     env_pairs.push(("LP_CORE_PORT".into(), core_port.to_string()));
@@ -134,9 +114,16 @@ pub fn launch(
     }
 
     // 3) 远程调 init 装 hook
-    if let Err(e) = call_remote_export(process.process, shim_path, "localproxy_shim_init") {
-        process.terminate(1);
-        return Err(e.into());
+    match call_remote_export(process.process, shim_path, "localproxy_shim_init") {
+        Ok(1) => {}
+        Ok(_) => {
+            process.terminate(1);
+            return Err(LaunchError::InjectFailed("代理 shim 未初始化".to_string()));
+        }
+        Err(error) => {
+            process.terminate(1);
+            return Err(error.into());
+        }
     }
 
     // 4) 恢复目标进程
@@ -155,6 +142,10 @@ pub fn launch(
 }
 
 impl Session {
+    pub fn pid(&self) -> u32 {
+        self.process.pid
+    }
+
     /// 进程是否仍在运行。
     pub fn is_running(&mut self) -> bool {
         let mut code = 0u32;
@@ -202,8 +193,6 @@ impl Drop for Session {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn cmd_line_quoting() {
         let entry = AppEntry {

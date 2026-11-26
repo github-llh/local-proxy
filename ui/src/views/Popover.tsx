@@ -49,7 +49,7 @@ export default function Popover() {
   const [busy, setBusy] = useState(false);
   const [showUpstreams, setShowUpstreams] = useState(false);
   const [switchingUpstream, setSwitchingUpstream] = useState(false);
-  const [latencies, setLatencies] = useState<Record<string, number>>({});
+  const [latencies, setLatencies] = useState<Record<string, string>>({});
   const [testingId, setTestingId] = useState<string | null>(null);
   const [exitIp, setExitIp] = useState<ExitIpInfo | null>(null);
   const [probing, setProbing] = useState(false);
@@ -124,8 +124,11 @@ export default function Popover() {
     setTestingId(id);
     setError(null);
     try {
-      const ms = await api.testUpstream(id);
-      setLatencies((prev) => ({...prev, [id]: ms}));
+      const result = await api.testUpstream(id);
+      setLatencies((prev) => ({
+        ...prev,
+        [id]: result.kind === "port" ? `${result.elapsed_ms} ms` : t("managed.engineReady")
+      }));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -273,7 +276,8 @@ export default function Popover() {
         <div className="section-head">
           <h2>{t("risk.title")}</h2>
           <div className="row-actions">
-            <button className="btn btn-small" onClick={handleProbe} disabled={probing}>
+            <button className="btn btn-small" onClick={handleProbe}
+                    disabled={probing || !status?.running || !status.exit_ip_probe_enabled}>
               {probing ? "…" : t("risk.probe")}
             </button>
             <button className="btn btn-small btn-ghost" onClick={handleLeakTest}>
@@ -305,7 +309,7 @@ export default function Popover() {
             <ConsistencyBadge countryCode={exitIp.country_code}/>
           </div>
         ) : (
-          <p className="muted">{t("risk.hint")}</p>
+          <p className="muted">{t(status?.exit_ip_probe_enabled ? "risk.hint" : "risk.disabled")}</p>
         )}
       </section>
 
@@ -325,7 +329,7 @@ export default function Popover() {
             {status?.upstream_type ? ` (${status.upstream_type})` : ""}
           </span>
           {activeLatency !== null && (
-            <span className="muted">{activeLatency} ms</span>
+            <span className="muted">{activeLatency}</span>
           )}
         </div>
         {showUpstreams && (
@@ -351,9 +355,9 @@ export default function Popover() {
                   className="btn btn-small btn-ghost"
                   onClick={() => handleTestUpstream(u.id)}
                   disabled={testingId !== null}
-                  title={t("popover.testUpstream")}
+                  title={t(u.managed ? "managed.testEngine" : "popover.testUpstream")}
                 >
-                  {testingId === u.id ? "…" : latencies[u.id] !== undefined ? `${latencies[u.id]}ms` : t("popover.test")}
+                  {testingId === u.id ? "…" : latencies[u.id] !== undefined ? latencies[u.id] : t("popover.test")}
                 </button>
               </li>
             ))}

@@ -13,6 +13,7 @@ export interface CoreStatus {
   active_upstream: string;
   active_upstream_id: string;
   upstream_type: string;
+  exit_ip_probe_enabled: boolean;
   upstreams: UpstreamSummary[];
 }
 
@@ -22,6 +23,7 @@ export interface UpstreamSummary {
   endpoint: string;
   server_type: string;
   clash_enabled: boolean;
+  managed: boolean;
 }
 
 export interface ClashController {
@@ -51,6 +53,13 @@ export interface SessionInfo {
   uptime_secs: number;
 }
 
+export interface ManagedNode {
+  protocol: string;
+  options: Record<string, unknown>;
+}
+
+export type UpstreamTest = { kind: "engine_ready" } | { kind: "port"; elapsed_ms: number };
+
 export interface UpstreamServer {
   id: string;
   name: string;
@@ -60,6 +69,7 @@ export interface UpstreamServer {
   username: string;
   password: string;
   clash?: ClashController;
+  managed?: ManagedNode;
 }
 
 export interface RoutingRule {
@@ -100,6 +110,7 @@ export interface AppConfig {
   control_port: number;
   control_token: string;
   log_level: string;
+  mihomo_path: string;
   upstream: { active: string; servers: UpstreamServer[] };
   routing: {
     enabled: boolean;
@@ -142,7 +153,9 @@ export const api = {
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),
   setAppEnabled: (id: string, enabled: boolean) =>
     invoke<void>("set_app_enabled", {id, enabled}),
-  testUpstream: (id: string, draft?: UpstreamServer) => invoke<number>("test_upstream", {id, draft}),
+  testUpstream: (id: string, draft?: UpstreamServer, mihomoPath?: string) =>
+    invoke<UpstreamTest>("test_upstream", {id, draft, mihomoPath}),
+  findMihomo: (path: string) => invoke<string>("find_mihomo", {path}),
   probeExitIp: () => invoke<ExitIpInfo>("probe_exit_ip"),
   listRecentConnections: (limit?: number) =>
     invoke<ConnectionRecord[]>("list_recent_connections", {limit}),

@@ -21,39 +21,55 @@
 
 use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::os::windows::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use localproxy_shim::config::ShimConfig;
 use localproxy_shim::engine;
 use windows_sys::s;
-use windows_sys::Win32::Foundation::{BOOL, FALSE, HANDLE, TRUE};
+use windows_sys::Win32::Foundation::{BOOL, TRUE};
 use windows_sys::Win32::Networking::WinSock::{
-    connect as sys_connect, getaddrinfo as sys_getaddrinfo, recv as sys_recv, send as sys_send,
-    GetAddrInfoW as sys_GetAddrInfoW, WSAGetLastError, WSAStartup, ADDRINFOW, INVALID_SOCKET,
-    SEND_RECV_FLAGS, SOCKADDR, SOCKET,
+    closesocket, socket, AF_INET, IPPROTO_TCP, SOCK_STREAM,
+};
+use windows_sys::Win32::Networking::WinSock::{
+    connect as sys_connect, getaddrinfo as sys_getaddrinfo, getsockopt, recv as sys_recv,
+    send as sys_send, sendto as sys_sendto, GetAddrInfoW as sys_GetAddrInfoW, WSAGetLastError,
+    WSASendTo as sys_WSASendTo, WSASetLastError, WSAStartup, ADDRINFOA, ADDRINFOW, AF_INET6,
+    AI_NUMERICHOST, LPWSAOVERLAPPED_COMPLETION_ROUTINE, SOCKADDR, SOCKET, SOCK_DGRAM, SOL_SOCKET,
+    SO_TYPE, WSABUF, WSAENETUNREACH, WSAHOST_NOT_FOUND,
 };
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 use windows_sys::Win32::System::Threading::{
     CreateProcessA as sys_CreateProcessA, CreateProcessW as sys_CreateProcessW,
     GetCurrentProcessId, PROCESS_INFORMATION, STARTUPINFOW,
 };
+use windows_sys::Win32::System::IO::OVERLAPPED;
 
 // ============= 原函数 trampoline =============
 
 type ConnectFn = unsafe extern "system" fn(SOCKET, *const SOCKADDR, i32) -> i32;
 type GetAddrInfoAFn =
-    unsafe extern "system" fn(*const u8, *const u8, *const u8, *mut *mut u8) -> i32;
+    unsafe extern "system" fn(*const u8, *const u8, *const ADDRINFOA, *mut *mut ADDRINFOA) -> i32;
 type GetAddrInfoWFn =
     unsafe extern "system" fn(*const u16, *const u16, *const ADDRINFOW, *mut *mut ADDRINFOW) -> i32;
-type RecvFn = unsafe extern "system" fn(SOCKET, *const u8, i32, SEND_RECV_FLAGS) -> i32;
-type SendFn = unsafe extern "system" fn(SOCKET, *const u8, i32, SEND_RECV_FLAGS) -> i32;
+type SendToFn = unsafe extern "system" fn(SOCKET, *const u8, i32, i32, *const SOCKADDR, i32) -> i32;
+
+type WSASendToFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *const SOCKADDR,
+    i32,
+    *mut OVERLAPPED,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32;
 
 static mut ORIG_CONNECT: Option<ConnectFn> = None;
 static mut ORIG_GETADDRINFO: Option<GetAddrInfoAFn> = None;
 static mut ORIG_GETADDRINFOW: Option<GetAddrInfoWFn> = None;
-static mut ORIG_RECV: Option<RecvFn> = None;
-static mut ORIG_SEND: Option<SendFn> = None;
+static mut ORIG_SENDTO: Option<SendToFn> = None;
+static mut ORIG_WSA_SENDTO: Option<WSASendToFn> = None;
 
 // ============= 平台 SockIo 实现 =============
 
@@ -94,6 +110,14 @@ impl engine::SockIo for WinSockIo {
         n as isize
     }
 
+    fn raw_socket(&self) -> i64 {
+        unsafe { socket(i32::from(AF_INET), SOCK_STREAM, IPPROTO_TCP) as i64 }
+    }
+
+    fn raw_close(&self, fd: i64) {
+        unsafe { closesocket(fd as SOCKET) };
+    }
+
     fn core_addr(&self) -> Option<SocketAddr> {
         // 核心地址必须是 IP 字面量（避免经 getaddrinfo hook 拿到 FakeIP 成环）
         engine::config().core_endpoint().parse().ok()
@@ -109,21 +133,21 @@ static INSTALLED: AtomicBool = AtomicBool::new(false);
 // ============= hook 函数 =============
 
 /// 解析 SOCKADDR 为 Rust SocketAddr。
-unsafe fn parse_sockaddr(addr: *const SOCKADDR) -> Option<SocketAddr> {
-    if addr.is_null() {
+unsafe fn parse_sockaddr(addr: *const SOCKADDR, len: i32) -> Option<SocketAddr> {
+    if addr.is_null() || len < 2 {
         return None;
     }
     // SAFETY: 调用方保证 addr 有效
     let family = unsafe { (*addr).sa_family } as i32;
-    if family == 2 {
+    if family == 2 && len >= 16 {
         // AF_INET
         // SAFETY: family 已判定
         let sin =
             unsafe { &*(addr as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN) };
-        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.S_un.S_addr as u32));
+        let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.S_un.S_addr));
         let port = u16::from_be(sin.sin_port);
         Some(SocketAddr::from((ip, port)))
-    } else if family == 23 {
+    } else if family == 23 && len >= 28 {
         // AF_INET6
         // SAFETY: family 已判定
         let sin6 =
@@ -143,9 +167,16 @@ unsafe extern "system" fn hook_connect(fd: SOCKET, addr: *const SOCKADDR, len: i
         return call_orig_connect(fd, addr, len);
     };
     // SAFETY: 调用方保证 addr/len 有效
-    let Some(target) = (unsafe { parse_sockaddr(addr) }) else {
+    let Some(target) = (unsafe { parse_sockaddr(addr, len) }) else {
         return call_orig_connect(fd, addr, len);
     };
+    if is_datagram(fd) {
+        return if refuse_unproxied_udp(&target) {
+            -1
+        } else {
+            call_orig_connect(fd, addr, len)
+        };
+    }
     match engine::proxy_connect(&IO, fd as i64, &target) {
         Ok(true) => 0,
         Ok(false) => call_orig_connect(fd, addr, len),
@@ -164,12 +195,80 @@ unsafe fn call_orig_connect(fd: SOCKET, addr: *const SOCKADDR, len: i32) -> i32 
     }
 }
 
+fn is_datagram(fd: SOCKET) -> bool {
+    let mut kind: i32 = 0;
+    let mut len = std::mem::size_of::<i32>() as i32;
+    let result = unsafe {
+        getsockopt(
+            fd,
+            SOL_SOCKET,
+            SO_TYPE,
+            (&mut kind as *mut i32).cast(),
+            &mut len,
+        )
+    };
+    result == 0 && kind == SOCK_DGRAM
+}
+
+fn refuse_unproxied_udp(target: &SocketAddr) -> bool {
+    if matches!(engine::proxy_udp(target), engine::UdpOutcome::Direct) {
+        return false;
+    }
+    unsafe { WSASetLastError(WSAENETUNREACH) };
+    true
+}
+
+/// Windows shim 尚未中继报文，需代理的公网 UDP 返回错误。
+unsafe extern "system" fn hook_sendto(
+    fd: SOCKET,
+    buf: *const u8,
+    len: i32,
+    flags: i32,
+    target: *const SOCKADDR,
+    target_len: i32,
+) -> i32 {
+    if let Some(target) = unsafe { parse_sockaddr(target, target_len) } {
+        if refuse_unproxied_udp(&target) {
+            return -1;
+        }
+    }
+    match unsafe { ORIG_SENDTO } {
+        Some(original) => unsafe { original(fd, buf, len, flags, target, target_len) },
+        None => unsafe { sys_sendto(fd, buf, len, flags, target, target_len) },
+    }
+}
+
+unsafe extern "system" fn hook_wsa_sendto(
+    fd: SOCKET,
+    bufs: *const WSABUF,
+    count: u32,
+    sent: *mut u32,
+    flags: u32,
+    target: *const SOCKADDR,
+    target_len: i32,
+    overlapped: *mut OVERLAPPED,
+    completion: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32 {
+    if unsafe { parse_sockaddr(target, target_len) }
+        .as_ref()
+        .is_some_and(refuse_unproxied_udp)
+    {
+        return -1;
+    }
+    let sendto = unsafe { ORIG_WSA_SENDTO }.unwrap_or(sys_WSASendTo);
+    unsafe {
+        sendto(
+            fd, bufs, count, sent, flags, target, target_len, overlapped, completion,
+        )
+    }
+}
+
 /// `getaddrinfo`（ANSI）替换实现：非本地域名返回 FakeIP。
 unsafe extern "system" fn hook_getaddrinfo(
     node: *const u8,
     service: *const u8,
-    hints: *const u8,
-    res: *mut *mut u8,
+    hints: *const ADDRINFOA,
+    res: *mut *mut ADDRINFOA,
 ) -> i32 {
     ensure_installed();
     let Some(_guard) = engine::HookGuard::enter() else {
@@ -186,42 +285,28 @@ unsafe extern "system" fn hook_getaddrinfo(
     if !engine::should_fakeip(host) {
         return call_orig_getaddrinfo(node, service, hints, res);
     }
-    // SAFETY: hints 有效
-    if !hints.is_null() {
-        let h = unsafe { &*(hints as *const AddrinfoACompat) };
-        if h.ai_flags & 0x4 != 0 || h.ai_flags & 0x1 != 0 {
-            // AI_NUMERICHOST / AI_PASSIVE 不代理
-            return call_orig_getaddrinfo(node, service, hints, res);
-        }
-    }
-    // SAFETY: service 为 C 字符串或 NULL
-    let service_str = if service.is_null() {
-        None
+    let mut hints = if hints.is_null() {
+        std::mem::zeroed::<ADDRINFOA>()
     } else {
-        unsafe { std::ffi::CStr::from_ptr(service as *const std::ffi::c_char) }
-            .to_str()
-            .ok()
+        *hints
     };
-    let port = engine::parse_service_port(service_str);
-    let Some(ip) = engine::fakeip_lock().assign(host) else {
-        return call_orig_getaddrinfo(node, service, hints, res);
-    };
-    let fake_ip = Ipv4Addr::from(ip);
-    // SAFETY: res 非空
-    match unsafe { build_fake_addrinfo_ansi(fake_ip, port) } {
-        Some(ai) => {
-            unsafe { *res = ai as *mut u8 };
-            0
-        }
-        None => 8, // EAI_MEMORY 近似（Windows: EAI_MEMORY=8? 实际 11001 WSANO_DATA）
+    if hints.ai_flags & AI_NUMERICHOST as i32 != 0 || hints.ai_family == i32::from(AF_INET6) {
+        return WSAHOST_NOT_FOUND;
     }
+    let Some(ip) = engine::fakeip_lock().assign(host) else {
+        return WSAHOST_NOT_FOUND;
+    };
+    // 由系统构造数值地址的结果，保持 socket hint 和 freeaddrinfo 的内存契约。
+    hints.ai_flags |= AI_NUMERICHOST as i32;
+    let numeric = std::ffi::CString::new(Ipv4Addr::from(ip).to_string()).expect("有效 IPv4 地址");
+    call_orig_getaddrinfo(numeric.as_ptr().cast(), service, &hints, res)
 }
 
 unsafe fn call_orig_getaddrinfo(
     node: *const u8,
     service: *const u8,
-    hints: *const u8,
-    res: *mut *mut u8,
+    hints: *const ADDRINFOA,
+    res: *mut *mut ADDRINFOA,
 ) -> i32 {
     // SAFETY: install 后 ORIG_GETADDRINFO 已填充
     match unsafe { ORIG_GETADDRINFO } {
@@ -251,32 +336,24 @@ unsafe extern "system" fn hook_getaddrinfo_w(
     if !engine::should_fakeip(&host) {
         return call_orig_getaddrinfo_w(node, service, hints, res);
     }
-    // SAFETY: hints 有效
-    if !hints.is_null() {
-        let h = unsafe { &*hints };
-        if h.ai_flags & 0x4 != 0 || h.ai_flags & 0x1 != 0 {
-            return call_orig_getaddrinfo_w(node, service, hints, res);
-        }
-    }
-    // SAFETY: service 为宽字符串或 NULL
-    let service_str = if service.is_null() {
-        None
+    let mut hints = if hints.is_null() {
+        std::mem::zeroed::<ADDRINFOW>()
     } else {
-        wide_to_string(service).ok()
+        *hints
     };
-    let port = engine::parse_service_port(service_str.as_deref());
-    let Some(ip) = engine::fakeip_lock().assign(&host) else {
-        return call_orig_getaddrinfo_w(node, service, hints, res);
-    };
-    let fake_ip = Ipv4Addr::from(ip);
-    // SAFETY: res 非空
-    match unsafe { build_fake_addrinfo_w(fake_ip, port) } {
-        Some(ai) => {
-            unsafe { *res = ai };
-            0
-        }
-        None => 11001, // WSANO_DATA 近似（内存不足）
+    if hints.ai_flags & AI_NUMERICHOST as i32 != 0 || hints.ai_family == i32::from(AF_INET6) {
+        return WSAHOST_NOT_FOUND;
     }
+    let Some(ip) = engine::fakeip_lock().assign(&host) else {
+        return WSAHOST_NOT_FOUND;
+    };
+    hints.ai_flags |= AI_NUMERICHOST as i32;
+    let numeric: Vec<_> = Ipv4Addr::from(ip)
+        .to_string()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    call_orig_getaddrinfo_w(numeric.as_ptr(), service, &hints, res)
 }
 
 unsafe fn call_orig_getaddrinfo_w(
@@ -293,83 +370,6 @@ unsafe fn call_orig_getaddrinfo_w(
 }
 
 // ============= 辅助 =============
-
-/// ANSI addrinfo 兼容布局（Windows `addrinfo` 内存布局稳定）。
-#[repr(C)]
-struct AddrinfoACompat {
-    ai_flags: i32,
-    ai_family: i32,
-    ai_socktype: i32,
-    ai_protocol: i32,
-    ai_addrlen: usize,
-    ai_canonname: *mut u8,
-    ai_addr: *mut u8,
-    ai_next: *mut u8,
-}
-
-/// 构造 ANSI FakeIP addrinfo（单节点，可被 freeaddrinfo 释放）。
-unsafe fn build_fake_addrinfo_ansi(ip: Ipv4Addr, port: u16) -> Option<*mut AddrinfoACompat> {
-    let ai = unsafe { std::alloc::alloc_zeroed(std::alloc::Layout::new::<AddrinfoACompat>()) }
-        as *mut AddrinfoACompat;
-    if ai.is_null() {
-        return None;
-    }
-    // sockaddr_in { family(2) port(2) addr(4) zero(8) } = 16 字节
-    let mut sa = [0u8; 16];
-    sa[0] = 2; // AF_INET (little-endian u16)
-    sa[1] = 0;
-    sa[2..4].copy_from_slice(&port.to_be_bytes());
-    sa[4..8].copy_from_slice(&ip.octets());
-    let sa_ptr = unsafe { std::alloc::alloc(std::alloc::Layout::from_size_align(16, 4).ok()?) };
-    if sa_ptr.is_null() {
-        unsafe { std::alloc::dealloc(ai as *mut u8, std::alloc::Layout::new::<AddrinfoACompat>()) };
-        return None;
-    }
-    unsafe { std::ptr::copy_nonoverlapping(sa.as_ptr(), sa_ptr, 16) };
-    unsafe {
-        (*ai).ai_family = 2;
-        (*ai).ai_socktype = 1; // SOCK_STREAM
-        (*ai).ai_protocol = 6; // IPPROTO_TCP
-        (*ai).ai_addrlen = 16;
-        (*ai).ai_addr = sa_ptr;
-    }
-    Some(ai)
-}
-
-/// 构造宽字符 FakeIP addrinfo（ADDRINFOW，可被 FreeAddrInfoW 释放）。
-unsafe fn build_fake_addrinfo_w(ip: Ipv4Addr, port: u16) -> Option<*mut ADDRINFOW> {
-    let ai = unsafe {
-        std::alloc::alloc_zeroed(std::alloc::Layout::new::<ADDRINFOW>()) as *mut ADDRINFOW
-    };
-    if ai.is_null() {
-        return None;
-    }
-    let sa = unsafe {
-        std::alloc::alloc_zeroed(
-            std::alloc::Layout::from_size_align(
-                std::mem::size_of::<windows_sys::Win32::Networking::WinSock::SOCKADDR_IN>(),
-                4,
-            )
-            .ok()?,
-        ) as *mut windows_sys::Win32::Networking::WinSock::SOCKADDR_IN
-    };
-    if sa.is_null() {
-        unsafe { std::alloc::dealloc(ai as *mut u8, std::alloc::Layout::new::<ADDRINFOW>()) };
-        return None;
-    }
-    unsafe {
-        (*sa).sin_family = 2;
-        (*sa).sin_port = port.to_be();
-        (*sa).sin_addr.S_un.S_addr = u32::from(ip).to_be();
-        (*ai).ai_family = 2;
-        (*ai).ai_socktype = 1;
-        (*ai).ai_protocol = 6;
-        (*ai).ai_addrlen =
-            std::mem::size_of::<windows_sys::Win32::Networking::WinSock::SOCKADDR_IN>() as usize;
-        (*ai).ai_addr = sa as *mut SOCKADDR;
-    }
-    Some(ai)
-}
 
 /// 宽字符串转 String（至多 NUL）。
 unsafe fn wide_to_string(ptr: *const u16) -> Result<String, std::string::FromUtf16Error> {
@@ -471,19 +471,6 @@ fn self_shim_dir() -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
-/// 读取宽字符命令行（至 NUL）。
-unsafe fn read_wide(ptr: *const u16) -> String {
-    if ptr.is_null() {
-        return String::new();
-    }
-    let mut len = 0usize;
-    // SAFETY: ptr 为宽字符串
-    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
-        len += 1;
-    }
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
-}
-
 /// 向新创建的子进程注入 shim（失败仅记录，不影响父进程行为）。
 fn inject_child(pi: &PROCESS_INFORMATION) {
     let policy = ChildPolicy::from_env();
@@ -497,12 +484,13 @@ fn inject_child(pi: &PROCESS_INFORMATION) {
     let Some(dll_path) = self_shim_path() else {
         return;
     };
-    if let Err(e) = localproxy_inject::inject_dll(pi.hProcess, &dll_path) {
+    let process = windows::Win32::Foundation::HANDLE(pi.hProcess);
+    if let Err(e) = localproxy_inject::inject_dll(process, &dll_path) {
         tracing::debug!("shim-win: 子进程注入失败 pid={}: {e}", pi.dwProcessId);
         return;
     }
     if let Err(e) =
-        localproxy_inject::call_remote_export(pi.hProcess, &dll_path, "localproxy_shim_init")
+        localproxy_inject::call_remote_export(process, &dll_path, "localproxy_shim_init")
     {
         tracing::debug!("shim-win: 子进程 init 失败 pid={}: {e}", pi.dwProcessId);
         return;
@@ -567,9 +555,15 @@ unsafe fn install_hooks() -> bool {
         _ => return false,
     };
 
-    let connect_addr = unsafe { GetProcAddress(ws2, s!("connect")) } as *const c_void;
-    let getaddrinfo_addr = unsafe { GetProcAddress(ws2, s!("getaddrinfo")) } as *const c_void;
-    let getaddrinfow_addr = unsafe { GetProcAddress(ws2, s!("GetAddrInfoW")) } as *const c_void;
+    let symbol = |module, name| {
+        unsafe { GetProcAddress(module, name) }
+            .map_or(std::ptr::null_mut(), |function| function as *mut c_void)
+    };
+    let connect_addr = symbol(ws2, s!("connect"));
+    let sendto_addr = symbol(ws2, s!("sendto"));
+    let wsa_sendto_addr = symbol(ws2, s!("WSASendTo"));
+    let getaddrinfo_addr = symbol(ws2, s!("getaddrinfo"));
+    let getaddrinfow_addr = symbol(ws2, s!("GetAddrInfoW"));
 
     macro_rules! hook {
         ($addr:expr, $hook:expr, $orig:ident) => {{
@@ -589,6 +583,12 @@ unsafe fn install_hooks() -> bool {
     }
 
     hook!(connect_addr, hook_connect as *mut c_void, ORIG_CONNECT);
+    hook!(sendto_addr, hook_sendto as *mut c_void, ORIG_SENDTO);
+    hook!(
+        wsa_sendto_addr,
+        hook_wsa_sendto as *mut c_void,
+        ORIG_WSA_SENDTO
+    );
     hook!(
         getaddrinfo_addr,
         hook_getaddrinfo as *mut c_void,
@@ -607,8 +607,8 @@ unsafe fn install_hooks() -> bool {
         h if !h.is_null() => h,
         _ => return false,
     };
-    let cpw_addr = unsafe { GetProcAddress(kernel32, s!("CreateProcessW")) } as *const c_void;
-    let cpa_addr = unsafe { GetProcAddress(kernel32, s!("CreateProcessA")) } as *const c_void;
+    let cpw_addr = symbol(kernel32, s!("CreateProcessW"));
+    let cpa_addr = symbol(kernel32, s!("CreateProcessA"));
     hook!(
         cpw_addr,
         hook_CreateProcessW as *mut c_void,
@@ -754,13 +754,13 @@ unsafe fn call_orig_cpw(
             sys_CreateProcessW(
                 app_name,
                 cmd_line,
-                process_attrs,
-                thread_attrs,
+                process_attrs.cast(),
+                thread_attrs.cast(),
                 inherit,
                 flags,
                 env,
                 cwd,
-                startup_info,
+                startup_info.cast(),
                 process_info,
             )
         },
@@ -855,13 +855,13 @@ unsafe fn call_orig_cpa(
             sys_CreateProcessA(
                 app_name,
                 cmd_line,
-                process_attrs,
-                thread_attrs,
+                process_attrs.cast(),
+                thread_attrs.cast(),
                 inherit,
                 flags,
                 env,
                 cwd,
-                startup_info,
+                startup_info.cast(),
                 process_info,
             )
         },
@@ -875,7 +875,7 @@ unsafe fn read_wide(ptr: *const u16) -> String {
     }
     let mut len = 0usize;
     // SAFETY: ptr 为宽字符串
-    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
+    while len < 4096 && unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(ptr, len) })
@@ -888,7 +888,7 @@ unsafe fn read_ansi(ptr: *const u8) -> String {
     }
     let mut len = 0usize;
     // SAFETY: ptr 为 ANSI 字符串
-    while unsafe { *ptr.add(len) } != 0 && len < 4096 {
+    while len < 4096 && unsafe { *ptr.add(len) } != 0 {
         len += 1;
     }
     String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).to_string()
@@ -912,8 +912,3 @@ pub unsafe extern "system" fn DllMain(
     }
     TRUE
 }
-
-// 抑制未使用告警（INVALID_SOCKET 仅文档用途）
-#[allow(dead_code)]
-const _INVALID_SOCKET: SOCKET = INVALID_SOCKET;
-const _FALSE: BOOL = FALSE;

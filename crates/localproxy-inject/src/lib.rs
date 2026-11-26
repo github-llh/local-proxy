@@ -18,15 +18,14 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Security::SECURITY_ATTRIBUTES;
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
     VirtualAllocEx, VirtualFreeEx, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE,
 };
 use windows::Win32::System::Threading::{
     CreateProcessW, CreateRemoteThreadEx, GetExitCodeThread, ResumeThread, TerminateProcess,
-    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTUPINFOW,
+    WaitForSingleObject, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, PROCESS_INFORMATION,
+    STARTUPINFOW,
 };
 
 /// 注入错误。
@@ -116,16 +115,22 @@ pub fn spawn_suspended(
     si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
 
+    let working_dir = exe.parent().map(to_wide);
+    let working_dir = windows::core::PCWSTR(
+        working_dir
+            .as_ref()
+            .map_or(std::ptr::null(), |dir| dir.as_ptr()),
+    );
     let created = unsafe {
         CreateProcessW(
             None,
-            windows::core::PWSTR(cmd_line_wide.as_mut_ptr()),
-            Some(&SECURITY_ATTRIBUTES::default()),
-            Some(&SECURITY_ATTRIBUTES::default()),
+            Some(windows::core::PWSTR(cmd_line_wide.as_mut_ptr())),
+            None,
+            None,
             false,
             CREATE_SUSPENDED | CREATE_UNICODE_ENVIRONMENT,
             Some(env_block.as_ptr() as *const std::ffi::c_void),
-            exe.parent(),
+            working_dir,
             &si,
             &mut pi,
         )
@@ -169,14 +174,14 @@ pub fn inject_dll(process: HANDLE, dll_path: &Path) -> Result<(), InjectError> {
         )
     };
     if write_ok.is_err() || written != size {
-        unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+        let _ = unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
         return Err(InjectError::Memory("WriteProcessMemory 失败".to_string()));
     }
 
     let kernel32 = match unsafe { GetModuleHandleW(windows::core::w!("kernel32.dll")) } {
         Ok(h) if !h.is_invalid() => h,
         _ => {
-            unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+            let _ = unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
             return Err(InjectError::RemoteThread(
                 "GetModuleHandleW(kernel32) 失败".to_string(),
             ));
@@ -185,7 +190,7 @@ pub fn inject_dll(process: HANDLE, dll_path: &Path) -> Result<(), InjectError> {
     let Some(load_library) =
         (unsafe { GetProcAddress(kernel32, windows::core::s!("LoadLibraryW")) })
     else {
-        unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+        let _ = unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
         return Err(InjectError::RemoteThread(
             "LoadLibraryW 地址获取失败".to_string(),
         ));
@@ -203,12 +208,12 @@ pub fn inject_dll(process: HANDLE, dll_path: &Path) -> Result<(), InjectError> {
             >(load_library as *mut std::ffi::c_void)),
             Some(remote),
             0,
-            Some(&LPPROC_THREAD_ATTRIBUTE_LIST::default()),
+            None,
             Some(&mut thread_id),
         )
     };
     let Ok(thread) = thread else {
-        unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+        let _ = unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
         return Err(InjectError::RemoteThread(
             "CreateRemoteThread(LoadLibraryW) 失败".to_string(),
         ));
@@ -217,8 +222,8 @@ pub fn inject_dll(process: HANDLE, dll_path: &Path) -> Result<(), InjectError> {
     let wait = unsafe { WaitForSingleObject(thread, 10_000) };
     let mut load_result = 0u32;
     let _ = unsafe { GetExitCodeThread(thread, &mut load_result) };
-    unsafe { CloseHandle(thread) };
-    unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
+    let _ = unsafe { CloseHandle(thread) };
+    let _ = unsafe { VirtualFreeEx(process, remote, 0, MEM_RELEASE) };
 
     if wait != WAIT_OBJECT_0 {
         return Err(InjectError::Timeout(
@@ -252,8 +257,10 @@ pub fn call_remote_export(
             module.err()
         )));
     };
+    let export_name = std::ffi::CString::new(export)
+        .map_err(|_| InjectError::RemoteThread("导出函数名无效".to_string()))?;
     let Some(func) =
-        (unsafe { GetProcAddress(module, windows::core::PCSTR::from_raw(export.as_ptr())) })
+        (unsafe { GetProcAddress(module, windows::core::PCSTR(export_name.as_ptr().cast())) })
     else {
         return Err(InjectError::RemoteThread(format!("未找到导出 {export}")));
     };
@@ -270,7 +277,7 @@ pub fn call_remote_export(
             >(func as *mut std::ffi::c_void)),
             None,
             0,
-            Some(&LPPROC_THREAD_ATTRIBUTE_LIST::default()),
+            None,
             Some(&mut thread_id),
         )
     };
@@ -280,7 +287,7 @@ pub fn call_remote_export(
     let wait = unsafe { WaitForSingleObject(thread, 15_000) };
     let mut result = 0u32;
     let _ = unsafe { GetExitCodeThread(thread, &mut result) };
-    unsafe { CloseHandle(thread) };
+    let _ = unsafe { CloseHandle(thread) };
     if wait != WAIT_OBJECT_0 {
         return Err(InjectError::Timeout(format!("等待 {export} 超时")));
     }

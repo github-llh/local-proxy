@@ -29,18 +29,15 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 **per-app 代理**
 
 - 菜单栏登记应用，一键「代理启动」；流量按规则分流（CIDR / 域名后缀与通配 / 端口 / 协议），内网自动直连
-- 上游支持 SOCKS5 / HTTP（含账密认证），多上游**热切换** + TCP 延迟测速
+- 接入 Clash / mihomo、Stash、v2rayN、Surge、Shadowsocks Windows 等客户端的 SOCKS5 / HTTP 端口，支持多上游热切换
+- 手动添加 Shadowsocks、VMess、VLESS、Trojan、Hysteria2、TUIC、AnyTLS、WireGuard 等节点，由独立 mihomo 实例承载
 - 本地核心同时是标准代理（SOCKS5 `1080` / HTTP CONNECT `1081`），CLI 可直接使用
 
-**泄漏零出口（默认 fail-closed）**
+**代理边界**
 
-| 泄漏面    | 机制                                                                                                                                                          |
-|:-------|:------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| DNS    | `getaddrinfo` / `gethostbyname(2)` / `GetAddrInfoW` 统一返回 FakeIP（198.18/15），域名经 SOCKS5 ATYP_DOMAIN 透传，应用**不发出真实 DNS 查询**；`getnameinfo` 反查还原域名，不暴露 FakeIP 字面量 |
-| WebRTC | STUN/UDP 默认**阻断**（`ENETUNREACH`，促使 QUIC→TCP、WebRTC 降级 TCP candidate）；`udp_mode=proxy` 时可全代理（ASSOCIATE + 双向 relay）                                           |
-| IPv6   | `ipv6_mode=block` 阻断公网 v6（`EAFNOSUPPORT`），封堵 host candidate 的 IPv6 全局地址                                                                                     |
-| 子进程    | macOS 经环境变量天然继承；Windows hook `CreateProcess` 主动注入（Chromium network_service 等多进程覆盖）                                                                          |
-| 协商失败   | 一律拒绝（`ECONNREFUSED`/`ENETUNREACH`），**绝不静默直连**                                                                                                               |
+- 已接管的代理连接在协商失败时拒绝出站。透传应用域名给上游，macOS 的部分系统解析入口支持 FakeIP。
+- 支持公网 IPv6 阻断和 UDP 策略，实际覆盖取决于平台与对应 API。回环、私网和显式直连规则保留。
+- 时区、语言和浏览器环境由应用和系统决定。详见 [共存与泄漏边界](docs/USAGE.md#共存与泄漏边界)。
 
 **风控自检**
 
@@ -51,8 +48,7 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 
 **与代理软件共存**
 
-- 与 Clash Verge / ClashX / mihomo / V2RayN 同时运行：端口分工（本核心 1080-1082）、启动时清理系统代理环境变量（不双跳）、*
-  *防自环校验**（上游误配自身端口直接拒绝）
+- 桌面核心会避开已配置或已占用的代理端口，实际监听地址显示在菜单栏。仅清理自己启动的子进程继承的代理环境变量。
 - 本方案为 socket 透传、**不做 MITM**，被代理应用的 TLS 指纹保持原生
 
 **菜单栏形态**
@@ -110,20 +106,18 @@ scripts/e2e/inject-e2e.sh
 ## 使用
 
 1. **添加应用**：popover「+ 添加」选择 `.app` / `.exe`（或手动编辑 `config.json` 的 `apps`）
-2. **代理启动**：点击应用的「代理启动」——以注入模式启动，流量全部经核心分流
+2. **代理启动**：点击应用的「代理启动」——以注入模式启动，受支持的连接按核心规则分流
 3. **选择上游**：在菜单栏面板切换 SOCKS5 / HTTP 上游，默认使用 `127.0.0.1:7890`。上游切换对新建连接生效。
 4. **选择 Clash 节点**：在设置的上游代理中启用 Clash / mihomo 节点选择，填入控制地址和 Secret。保存后可从菜单栏面板选择策略组和节点，订阅继续由
    Clash 管理。参见 [使用指南](docs/USAGE.md#在-localproxy-中切换-clash-节点)。
-5. **规则**：设置窗口编辑（域名 `.cn` 后缀、`*.example.com` 通配、CIDR、端口、协议），内网/回环自动直连。
+5. **手动节点**：在上游设置中手动添加节点，使用本机 mihomo。参见 [独立节点说明](docs/USAGE.md#手动添加独立节点)。
+6. **规则**：设置窗口编辑（域名 `.cn` 后缀、`*.example.com` 通配、CIDR、端口、协议），内网/回环自动直连。
 
 ## 安全模型
 
-- **默认 fail-closed**：一切非局域网出站（TCP/UDP/DNS）必经核心；任何协商失败即拒绝，不静默直连
-- **精确放行（不误伤）**：回环、私网（10/8、172.16/12、192.168/16、169.254/16、fc00::/7、fe80::/10）、mDNS（`.local`/`.localhost`/
-  `.lan`/`.home`/`.internal`）、规则命中 `direct` 的流量行为不变——e2e 对每类均有回归断言
-- **优雅降级**：阻断路径返回应用可理解的标准 errno（`ENETUNREACH` 促使 QUIC/WebRTC 回退 TCP，`EAFNOSUPPORT` 拒绝
-  v6），不崩溃、不挂起；非阻塞 socket 的 connect 语义完整保留（临时切阻塞协商后恢复，Electron/Chromium 默认模式回归覆盖）
-- **可审计**：popover「最近连接」展示每个连接的路由/规则/结果；泄漏投诉可举证
+- LocalProxy 和独立内核的监听限制在本机回环。独立内核使用随机认证，与其他代理隔离。
+- 已接管的 TCP 连接和 SOCKS5 UDP 关联在代理失败时返回错误。配置的直连规则继续生效。
+- 「最近连接」展示进入本地核心的目标、路由、规则和结果。其他代理的系统设置和 TUN 路由由对应软件管理。
 
 ## 配置
 

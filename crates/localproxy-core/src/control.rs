@@ -131,16 +131,17 @@ async fn handle(
 /// 校验完成后一次替换配置和规则，运行中的监听和已建立的连接继续使用原配置。
 async fn reload(ctx: &ServerContext, path: Option<&Path>) -> Result<String, String> {
     let path = path.ok_or("热重载需要使用 --config 启动核心")?;
-    let mut settings = ctx.settings.write().await;
+    let _reload = ctx.reload_lock.lock().await;
+    let previous = ctx.settings.read().await.clone();
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|e| format!("读取热重载配置失败: {e}"))?;
     let mut config = AppConfig::from_json_str(&text)?;
-    config.validate()?;
-    config.use_running_listeners(&settings.config);
+    config.use_running_listeners(&previous.config);
     config.validate()?;
     let id = config.upstream.active.clone();
-    *settings = RuntimeSettings::new(config);
+    let settings = RuntimeSettings::prepare(config, Some(&previous)).await?;
+    *ctx.settings.write().await = Arc::new(settings);
     Ok(id)
 }
 

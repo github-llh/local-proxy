@@ -14,8 +14,9 @@ use tokio::net::{TcpListener, TcpStream};
 
 use localproxy_net::socks5::{self, consts, reply_to_text, Timeouts};
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, UpstreamServer};
 use crate::diagnostics::{self, ConnectionLog, ConnectionRecord};
+use crate::managed::ManagedRuntime;
 use crate::rules::{Action, RuleEngine};
 use crate::stats::Stats;
 use crate::upstream::{Upstream, UpstreamError};
@@ -23,7 +24,8 @@ use crate::upstream::{Upstream, UpstreamError};
 /// 服务共享上下文。
 pub struct ServerContext {
     /// 新连接从同一份快照读取配置与编译后的规则。
-    pub(crate) settings: tokio::sync::RwLock<RuntimeSettings>,
+    pub(crate) settings: tokio::sync::RwLock<Arc<RuntimeSettings>>,
+    pub(crate) reload_lock: tokio::sync::Mutex<()>,
     /// 统计
     pub stats: Arc<Stats>,
     /// 连接诊断日志（环形缓冲）
@@ -33,21 +35,73 @@ pub struct ServerContext {
 pub(crate) struct RuntimeSettings {
     pub config: AppConfig,
     rules: RuleEngine,
+    managed: Option<Arc<ManagedRuntime>>,
 }
 
 impl RuntimeSettings {
     pub fn new(config: AppConfig) -> Self {
         let rules = RuleEngine::compile(&config.routing);
         tracing::info!("规则引擎: {}", rules.summary());
-        Self { config, rules }
+        Self {
+            config,
+            rules,
+            managed: None,
+        }
+    }
+    pub async fn prepare(config: AppConfig, previous: Option<&Self>) -> Result<Self, String> {
+        let mut settings = Self::new(config);
+        if let Some(server) = settings
+            .config
+            .upstream
+            .active_server()
+            .filter(|s| s.managed.is_some())
+        {
+            if let Some(previous) = previous.filter(|old| {
+                old.config.mihomo_path == settings.config.mihomo_path
+                    && old.config.upstream.active_server() == Some(server)
+                    && old
+                        .managed
+                        .as_ref()
+                        .is_some_and(|engine| engine.is_running())
+            }) {
+                settings.managed.clone_from(&previous.managed);
+            } else {
+                settings.managed = Some(Arc::new(
+                    ManagedRuntime::start(server, &settings.config.mihomo_path).await?,
+                ));
+            }
+        }
+        Ok(settings)
+    }
+
+    fn active_proxy(&self) -> Option<UpstreamServer> {
+        if let Some(runtime) = &self.managed {
+            return Some(runtime.server.clone());
+        }
+        self.config
+            .upstream
+            .active_server()
+            .filter(|s| s.managed.is_none())
+            .cloned()
     }
 }
 
 impl ServerContext {
     /// 由配置构造。
     pub fn new(config: AppConfig) -> Self {
+        Self::from_settings(RuntimeSettings::new(config))
+    }
+
+    pub async fn start(config: AppConfig) -> Result<Self, String> {
+        Ok(Self::from_settings(
+            RuntimeSettings::prepare(config, None).await?,
+        ))
+    }
+
+    fn from_settings(settings: RuntimeSettings) -> Self {
         Self {
-            settings: tokio::sync::RwLock::new(RuntimeSettings::new(config)),
+            settings: tokio::sync::RwLock::new(Arc::new(settings)),
+            reload_lock: tokio::sync::Mutex::new(()),
             stats: Arc::new(Stats::new()),
             connections: Arc::new(ConnectionLog::with_default_capacity()),
         }
@@ -151,23 +205,24 @@ impl From<UpstreamError> for DispatchError {
 
 impl ServerContext {
     /// 分流到上游或直连。
-    pub async fn dispatch(
+    async fn dispatch(
         &self,
         host: &str,
         port: u16,
-    ) -> Result<(TcpStream, Action, String), DispatchError> {
-        let (decision, server) = {
+    ) -> Result<(TcpStream, Action, String, Option<Arc<ManagedRuntime>>), DispatchError> {
+        let (decision, server, lease) = {
             let settings = self.settings.read().await;
             if !settings.config.proxy_rules.is_port_allowed(port) {
                 return Err(DispatchError::NotAllowed);
             }
             let decision = settings.rules.decide(host, None, port, "tcp");
             let server = if decision.action == Action::Proxy {
-                settings.config.upstream.active_server().cloned()
+                settings.active_proxy()
             } else {
                 None
             };
-            (decision, server)
+            let lease = server.as_ref().and(settings.managed.as_ref()).cloned();
+            (decision, server, lease)
         };
         match decision.action {
             Action::Direct => {
@@ -186,7 +241,7 @@ impl ServerContext {
                         DispatchError::Io(msg)
                     }
                 })?;
-                Ok((stream, Action::Direct, decision.rule))
+                Ok((stream, Action::Direct, decision.rule, None))
             }
             Action::Proxy => {
                 self.stats.on_routed_proxy();
@@ -195,7 +250,7 @@ impl ServerContext {
                 };
                 let upstream = Upstream::new(server, Self::timeouts());
                 let stream = upstream.connect(host, port).await?;
-                Ok((stream, Action::Proxy, decision.rule))
+                Ok((stream, Action::Proxy, decision.rule, lease))
             }
         }
     }
@@ -273,7 +328,7 @@ async fn handle_socks5(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: A
     tracing::debug!("SOCKS5 入站 {peer} -> {host}:{port}");
     ctx.stats.on_connect_started();
     match ctx.dispatch(&host, port).await {
-        Ok((upstream, action, rule)) => {
+        Ok((upstream, action, rule, _lease)) => {
             let _ = send_socks5_reply(&mut stream, consts::REPLY_SUCCESS).await;
             tracing::info!(
                 "SOCKS5 {peer} -> {host}:{port} [{}{}]",
@@ -314,21 +369,21 @@ async fn handle_udp_associate(
         return;
     }
 
-    let server = match ctx
-        .settings
-        .read()
-        .await
-        .config
-        .upstream
-        .active_server()
-        .cloned()
-    {
-        Some(server) => server,
-        None => {
-            let _ = send_socks5_reply(&mut control, 0x01).await;
-            return;
-        }
+    // 保持独立内核存活到本 UDP 关联结束。
+    let settings = ctx.settings.read().await.clone();
+    let Some(server) = settings.active_proxy() else {
+        let _ = send_socks5_reply(&mut control, 0x01).await;
+        return;
     };
+    if settings
+        .config
+        .proxy_rules
+        .effective_udp_action(server.udp_proxy_type())
+        != localproxy_net::udp::UdpAction::Proxy
+    {
+        let _ = send_socks5_reply(&mut control, 0x02).await;
+        return;
+    }
     let mut upstream = match Upstream::new(server, ServerContext::timeouts())
         .udp_associate()
         .await
@@ -505,7 +560,7 @@ async fn handle_http(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: Arc
     tracing::debug!("HTTP 入站 {peer} -> {host}:{port}");
     ctx.stats.on_connect_started();
     match ctx.dispatch(&host, port).await {
-        Ok((upstream, action, rule)) => {
+        Ok((upstream, action, rule, _lease)) => {
             let _ = stream
                 .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
                 .await;
@@ -544,7 +599,7 @@ async fn handle_http(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: Arc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{AppConfig, UpstreamServer, UpstreamSettings};
+    use crate::config::UpstreamSettings;
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -690,6 +745,7 @@ mod tests {
                 username: String::new(),
                 password: String::new(),
                 clash: None,
+                managed: None,
             }],
         };
         config

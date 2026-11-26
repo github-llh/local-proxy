@@ -31,6 +31,19 @@ target/debug/localproxy-core --config ./config.json
 菜单栏面板和设置均可切换。新 TCP 连接和 UDP 关联使用切换后的上游，已建立的连接继续使用原上游。
 监听地址和端口在核心重启后生效。
 
+### 连接现有代理软件
+
+在「设置 → 上游代理」选择预设并点击「添加上游」，按客户端当前监听配置修改地址和端口。下面的端口是预设值。
+
+| 客户端                           | 预设代理端口                         | 节点选择                          |
+|:------------------------------|:-------------------------------|:------------------------------|
+| Clash Verge / ClashX / mihomo | SOCKS5 / mixed `7890`          | 可启用 Clash 兼容控制接口              |
+| Stash（macOS）                  | SOCKS5 / mixed `7890`          | 可启用 Clash 兼容控制接口              |
+| v2rayN                        | SOCKS5 / mixed `10808`         | 沿用客户端当前策略。客户端启用兼容控制接口时可手填     |
+| Surge（macOS）                  | SOCKS5 `6153`，也可手填 HTTP `6152` | 沿用 Surge 当前策略，需在 Surge 启用相应监听 |
+| Shadowsocks Windows           | SOCKS5 `1080`                  | 沿用客户端当前策略                     |
+| sing-box、Xray、Hiddify 或其他客户端  | 填写实际 SOCKS5 / HTTP CONNECT 监听  | 沿用客户端当前策略                     |
+
 ### 在 LocalProxy 中切换 Clash 节点
 
 1. 在 Clash / mihomo 中开启本机 `external-controller`，如 `127.0.0.1:9090`，并确认 `secret`。代理端口通常是 `mixed-port`，如
@@ -41,6 +54,19 @@ target/debug/localproxy-core --config ./config.json
 
 规则模式下，Clash 按目标匹配策略组。全局模式下，`GLOBAL` 策略组决定出口。在 LocalProxy 切换节点会更新 Clash
 的共享策略组，也会影响使用该组的其他流量。订阅导入和更新在 Clash 中完成。可用策略组取决于当前订阅配置。
+
+### 手动添加独立节点
+
+1. 在「设置 → 上游代理」点击「手动添加节点」，填写名称、节点服务器、端口和对应协议字段。
+2. 使用系统中已安装的 mihomo。路径留空会查找同目录、PATH 和已知的 Clash Verge 安装位置。也可以手动选择内核可执行文件。
+3. 在「传输与协议高级参数」填写单节点的 Mihomo JSON 对象，例如 `{"tls":true,"network":"ws","ws-opts":{"path":"/proxy"}}`
+   。不同协议、传输、加密和扩展字段由所选 mihomo 版本解析。保存后可以在菜单栏和其他上游之间切换。
+
+支持 Shadowsocks / ShadowsocksR、VMess、VLESS、Trojan、Hysteria2、TUIC、AnyTLS、WireGuard、Snell、SSH、HTTP(S) 和 SOCKS5（含
+TLS）。HTTP 与 SOCKS5 常规上游可以直接填写，无需启动
+mihomo。「检查节点配置」验证内核能否加载并启动该节点，实际出口可通过应用或出口探测确认。 [Mihomo 单节点参数](https://wiki.metacubex.one/config/proxies/)
+
+独立节点使用单独的临时配置及带随机认证的回环 SOCKS5 监听。切换时，新连接进入新上游，旧连接仍持有原内核。桌面核心退出后回收所启动的独立内核。节点配置和密钥留在本机配置文件中。
 
 ## 路由规则
 
@@ -65,32 +91,27 @@ target/debug/localproxy-core --config ./config.json
 
 popover「风控自检」卡片（探测默认关闭，在设置 → 高级开启后点击触发）：
 
-- **出口探测**：经上游访问 HTTP 端点，显示出口 IP / 国家 / 城市 / ISP——即被代理应用可见的出口身份；
+- **出口探测**：通过核心的当前路由访问配置的 HTTP 端点，显示该请求的出口 IP / 国家 / 城市 / ISP；
 - **一致性校验**：出口国家 vs 系统时区 vs 系统语言，任一匹配即一致，都不匹配给警告
   （对应 Certta/Verisoul 等平台的 Timezone Mismatch 检测规则）；
-- **泄漏自检**：browserleaks.com 一键打开（检测浏览器指纹；注入应用的泄漏用「最近连接」佐证）。
+- **打开 BrowserLeaks**：用系统默认浏览器打开检测页。要验证指定应用，请在该应用中访问检测页。
 
-「最近连接」折叠列表展示每个连接的目标、路由（proxy/direct/blocked）与命中规则，
-排障与泄漏投诉时可举证 fail-closed 生效。
+「最近连接」折叠列表展示经过核心的连接目标、路由（proxy/direct/blocked）与命中规则，
+该列表用来确认进入核心的流量及路由结果。
 
-## 与 Clash / V2RayN 等代理软件共存
+## 共存与泄漏边界
 
-LocalProxy 定位是 **per-app 注入层**，Clash Verge / ClashX / mihomo / V2RayN 等作为
-**上游分流层**，两者同时开、互不干扰：
-
-- **端口不冲突**：核心默认 `1080/1081/1082`，Clash 默认 `7890/7891/7892`；若你改过
-  Clash 端口产生冲突，在设置里改核心端口（启动前有端口预检与友好报错）；
-- **上游指向 Clash**：默认上游 `127.0.0.1:7890`（Clash mixed 端口）。LocalProxy 的规则先决定流量是否交给 Clash。进入 Clash
-  后，出口由 Clash 当前模式和策略组决定。
-- **防自环**：上游若误配为本核心自己的端口（如链式代理配反），启动时直接报错拒绝，
-  不会形成无限回环；
-- **系统代理不干扰**：启动被代理应用时，launcher 会清理 `http_proxy`/`ALL_PROXY` 等
-  环境变量——应用处于「无代理」环境，由 shim 全权接管，不会与 Clash 的系统代理双跳；
-- **TUN 模式不冲突**：Clash 开 TUN 时，注入进程的连接在 socket 层就被 shim 拦截
-  （先于内核网络栈），不进入 TUN 路由；未注入的进程仍走 Clash TUN，行为不变；
-- **Fake-IP 段**：默认 `198.18.0.0/15` 与 Clash 默认 fake-ip-range 相同，但注入进程
-  的解析被 hook 直接接管（不经过系统 DNS/Clash DNS 劫持），无实际冲突；如仍有
-  顾虑可在设置修改 `fake_ip.cidr`。
+- **端口**：桌面核心检测已配置或被其他服务占用的端口，自动使用空闲回环端口，菜单栏显示实际端口。偏好端口保留在设置中，重启时重新尝试。CLI
+  使用明确配置的监听端口。
+- **系统设置**：LocalProxy 仅从自己启动的应用和内核环境中移除代理环境变量。系统代理、PAC、DNS、TUN、路由表及现有代理进程由原软件管理。
+- **外部代理策略**：切换 Clash 兼容策略组会影响同组的其他流量。需要为 LocalProxy 单独选出口时，使用独立节点。
+- **已覆盖的出站**：代理协商失败时拒绝连接。macOS 的 FakeIP 解析失败时也会返回错误，公网地址反查使用数字地址或返回无名称，避免向系统发出
+  PTR 查询。
+- **边界**：应用可读取系统代理或使用未覆盖的 DNS / 网络 API，外部 TUN 也可能捕获 LocalProxy 或独立 mihomo
+  的出站。独立节点服务器使用域名时仍可能需要系统解析。时区、语言、浏览器指纹仍由应用和系统决定。
+- **局域网与 UDP**：回环、私网和本地域名保留既有放行行为。显式的 `direct` 规则和 UDP 直连设置允许相应流量直连。Windows
+  注入层在受支持的 socket 入口阻断必须代理的公网 UDP，完整 UDP 中继可由应用直接使用 LocalProxy 的 SOCKS5 端口。Windows 的网络
+  API 覆盖与 macOS 不同。
 
 ## 已知限制（不开 TUN 的固有权衡）
 

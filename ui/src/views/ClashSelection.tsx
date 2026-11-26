@@ -96,6 +96,7 @@ export default function ClashSelection({upstreamId, onChanged}: {
               </label>
             </div>
           ) : <p className="muted">{t("clash.noGroups")}</p>}
+          {group && snapshot.mode !== "direct" && <p className="muted">{t("clash.shared")}</p>}
         </div>
       )}
     </section>

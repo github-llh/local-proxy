@@ -239,7 +239,7 @@ impl Upstream {
         Ok(stream)
     }
 
-    async fn open_socks5(&self) -> Result<TcpStream, UpstreamError> {
+    pub(crate) async fn open_socks5(&self) -> Result<TcpStream, UpstreamError> {
         let mut stream = tokio::time::timeout(
             self.timeouts.connect_timeout(),
             TcpStream::connect(self.server.endpoint()),
@@ -256,7 +256,12 @@ impl Upstream {
             username: self.server.username.clone(),
             password: self.server.password.clone(),
         };
-        let mut methods = vec![consts::AUTH_NONE];
+        let require_auth = self.server.managed.is_some();
+        let mut methods = if require_auth {
+            Vec::new()
+        } else {
+            vec![consts::AUTH_NONE]
+        };
         if auth.has_credentials() {
             methods.push(consts::AUTH_USERPASS);
         }
@@ -281,7 +286,7 @@ impl Upstream {
         }
         if method_resp[1] == consts::AUTH_USERPASS {
             self.authenticate_userpass(&mut stream, &auth).await?;
-        } else if method_resp[1] != consts::AUTH_NONE {
+        } else if require_auth || method_resp[1] != consts::AUTH_NONE {
             return Err(UpstreamError::Auth(format!(
                 "上游要求不支持的认证方式: {:#04x}",
                 method_resp[1]

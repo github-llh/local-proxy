@@ -289,15 +289,7 @@ pub fn proxy_udp(target: &SocketAddr) -> UdpOutcome {
             );
             UdpOutcome::Blocked(udp_blocked_error())
         }
-        UdpMode::Proxy => {
-            // S2 落地前按 block 处理（fail-closed），并明确记录
-            tracing::debug!(
-                "shim: UDP proxy 尚未实现，临时按 block {}:{}",
-                target.ip(),
-                target.port()
-            );
-            UdpOutcome::Blocked(udp_blocked_error())
-        }
+        UdpMode::Proxy => UdpOutcome::Proxy,
     }
 }
 
