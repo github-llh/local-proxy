@@ -21,3 +21,27 @@ pub use macos::{
 
 #[cfg(target_os = "windows")]
 pub use windows::{launch, LaunchError, Session};
+
+/// 代理启动所需的实际监听端点与本次核心的运行期策略。
+pub struct LaunchConfig<'a> {
+    pub core: std::net::SocketAddr,
+    pub policy_path: &'a std::path::Path,
+}
+
+impl LaunchConfig<'_> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn environment(&self) -> [(&'static str, String); 5] {
+        use localproxy_net::{fakeip::FakeIp, policy::POLICY_PATH_ENV};
+
+        [
+            ("LP_CORE_HOST", self.core.ip().to_string()),
+            ("LP_CORE_PORT", self.core.port().to_string()),
+            ("LP_FAKEIP_CIDR", FakeIp::DEFAULT_CIDR.to_string()),
+            ("LP_MODE", "proxy".to_string()),
+            (
+                POLICY_PATH_ENV,
+                self.policy_path.to_string_lossy().into_owned(),
+            ),
+        ]
+    }
+}

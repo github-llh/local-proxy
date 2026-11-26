@@ -4,24 +4,24 @@
 行为：
 1. 完成 SOCKS5 方法协商（无认证）；
 2. 记录每个 CONNECT 目标到 --seen 文件（供断言）；
-3. 隧道建立后直接返回一个固定 HTTP 200 响应（MOCK-UPSTREAM-OK），
-   并把客户端发送的首个请求体回显（验证双向数据通路）。
+3. CONNECT 返回固定 HTTP 响应，UDP ASSOCIATE 回显 SOCKS5 数据报。
 
 用法：
     python3 mock_upstream.py --port 19080 --seen /tmp/lp-e2e-seen.txt
 """
 
 import argparse
+import json
+import selectors
 import socket
 import struct
 import sys
 import threading
-import time
 
 HTTP_RESPONSE = (
     b"HTTP/1.1 200 OK\r\n"
     b"Content-Type: text/plain\r\n"
-    b"Content-Length: 18\r\n"
+    b"Content-Length: 17\r\n"
     b"Connection: close\r\n"
     b"\r\n"
     b"MOCK-UPSTREAM-OK\n"
@@ -38,9 +38,8 @@ def recv_exact(conn: socket.socket, n: int) -> bytes:
     return buf
 
 
-def read_socks5_request(conn: socket.socket) -> str:
-    head = recv_exact(conn, 4)
-    ver, cmd, rsv, atyp = head
+def read_socks5_request(conn: socket.socket) -> tuple[int, str]:
+    _, cmd, _, atyp = recv_exact(conn, 4)
     if atyp == 0x01:
         addr = socket.inet_ntoa(recv_exact(conn, 4))
     elif atyp == 0x04:
@@ -51,18 +50,44 @@ def read_socks5_request(conn: socket.socket) -> str:
     else:
         raise ValueError(f"bad atyp {atyp}")
     port = struct.unpack(">H", recv_exact(conn, 2))[0]
-    return f"{addr}:{port}"
+    return cmd, f"{addr}:{port}"
 
 
-def handle(conn: socket.socket, seen_path: str) -> None:
+def handle_udp_associate(conn: socket.socket, seen_path: str) -> None:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as relay, selectors.DefaultSelector() as ready:
+        relay.bind(("127.0.0.1", 0))
+        conn.sendall(b"\x05\x00\x00\x01\x7f\x00\x00\x01" + struct.pack(">H", relay.getsockname()[1]))
+        ready.register(conn, selectors.EVENT_READ)
+        ready.register(relay, selectors.EVENT_READ)
+        while True:
+            for key, _ in ready.select():
+                if key.fileobj == conn:
+                    return
+                packet, client = relay.recvfrom(65535)
+                if len(packet) < 7 or packet[:4] != b"\x00\x00\x00\x03":
+                    continue
+                host_end = 5 + packet[4]
+                host = packet[5:host_end].decode("ascii")
+                port = int.from_bytes(packet[host_end:host_end + 2], "big")
+                with open(seen_path, "a") as log:
+                    log.write(f"UDP ASSOCIATE {host}:{port}\n")
+                relay.sendto(packet, client)
+
+
+def handle(conn: socket.socket, seen_path: str, udp_seen_path: str) -> None:
     try:
         # 方法协商
         head = recv_exact(conn, 2)
         nmethods = head[1]
         recv_exact(conn, nmethods)
         conn.sendall(b"\x05\x00")
-        # CONNECT 请求
-        target = read_socks5_request(conn)
+        cmd, target = read_socks5_request(conn)
+        if cmd == 3:
+            handle_udp_associate(conn, udp_seen_path)
+            return
+        if cmd != 1:
+            conn.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
         with open(seen_path, "a") as f:
             f.write(target + "\n")
         # 成功响应（BND 0.0.0.0:0）
@@ -104,7 +129,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=19080)
     parser.add_argument("--seen", default="/tmp/lp-e2e-seen.txt")
     parser.add_argument("--ready-file", default=None)
-    parser.add_argument("--udp-port", type=int, default=0, help="UDP echo 端口（0=不监听）")
+    parser.add_argument("--udp-port", type=int, help="UDP echo 端口（0=自动分配）")
     parser.add_argument("--udp-seen", default="/tmp/lp-e2e-udp-seen.txt")
     args = parser.parse_args()
 
@@ -112,27 +137,28 @@ def main() -> int:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(("127.0.0.1", args.port))
     server.listen(16)
-    print(f"[mock] listening on 127.0.0.1:{args.port}", flush=True)
+    # UDP echo（验证「局域网 UDP 放行、公网 UDP 阻断」）
+    udp = None
+    if args.udp_port is not None:
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        udp.bind(("127.0.0.1", args.udp_port))
+        threading.Thread(target=udp_echo_loop, args=(udp, args.udp_seen), daemon=True).start()
+    print(json.dumps({"tcp": server.getsockname()[1], "udp": udp.getsockname()[1] if udp else None}), flush=True)
     if args.ready_file:
         with open(args.ready_file, "w") as f:
             f.write("ready")
 
-    # UDP echo（验证「局域网 UDP 放行、公网 UDP 阻断」）
-    if args.udp_port > 0:
-        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        udp.bind(("127.0.0.1", args.udp_port))
-        print(f"[mock] udp echo on 127.0.0.1:{args.udp_port}", flush=True)
-        threading.Thread(target=udp_echo_loop, args=(udp, args.udp_seen), daemon=True).start()
-
     try:
         while True:
             conn, _ = server.accept()
-            threading.Thread(target=handle, args=(conn, args.seen), daemon=True).start()
+            threading.Thread(target=handle, args=(conn, args.seen, args.udp_seen), daemon=True).start()
     except KeyboardInterrupt:
         pass
     finally:
         server.close()
+        if udp is not None:
+            udp.close()
     return 0
 
 

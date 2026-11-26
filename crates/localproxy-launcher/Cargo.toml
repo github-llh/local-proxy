@@ -6,9 +6,13 @@ license.workspace = true
 description = "LocalProxy 平台启动器：macOS .app 解析/exec + DYLD 注入，Windows CreateProcess + DLL 注入"
 
 [dependencies]
+localproxy-net.workspace = true
 serde.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 localproxy-inject.workspace = true
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"

@@ -2,9 +2,12 @@
 //!
 //! 不依赖第三方插件：直接写平台标准位置，行为透明可控。
 
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 
+#[cfg(any(target_os = "macos", test))]
 const LABEL: &str = "com.localproxy.app";
 
 /// autostart 错误。
@@ -27,12 +30,14 @@ impl std::fmt::Display for AutoStartError {
 impl std::error::Error for AutoStartError {}
 
 /// 当前 App 可执行路径。
+#[cfg(any(target_os = "macos", target_os = "windows", test))]
 fn app_executable() -> Result<PathBuf, AutoStartError> {
     std::env::current_exe().map_err(|e| AutoStartError::Io(e.to_string()))
 }
 
 /// 启用开机自启。
 pub fn enable() -> Result<(), AutoStartError> {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     let exe = app_executable()?;
     #[cfg(target_os = "macos")]
     {

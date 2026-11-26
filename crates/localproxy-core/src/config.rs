@@ -317,6 +317,7 @@ impl Default for UiSettings {
 /// 桌面程序使用核心实际绑定的地址启动被代理应用。
 #[derive(Serialize, Deserialize)]
 pub struct ListenerInfo {
+    pub policy_path: Option<std::path::PathBuf>,
     pub listen_host: String,
     pub socks5_port: u16,
     pub http_port: u16,
@@ -370,8 +371,19 @@ impl Default for AppConfig {
 impl AppConfig {
     /// 从 JSON 字符串解析并 sanitize。
     pub fn from_json_str(text: &str) -> Result<Self, String> {
-        let mut config: Self =
+        let mut value: serde_json::Value =
             serde_json::from_str(text).map_err(|e| format!("JSON 解析失败: {e}"))?;
+        if value.get("dns_mode").is_none() {
+            let inherited = value
+                .pointer("/proxy_rules/dns_mode")
+                .and_then(|mode| mode.as_str())
+                .map(str::to_owned);
+            if let (Some(mode), Some(fields)) = (inherited, value.as_object_mut()) {
+                fields.insert("dns_mode".to_string(), mode.into());
+            }
+        }
+        let mut config: Self =
+            serde_json::from_value(value).map_err(|e| format!("配置解析失败: {e}"))?;
         config.sanitize();
         Ok(config)
     }
@@ -599,6 +611,8 @@ impl AppConfig {
             self.dns_mode = DEFAULT_DNS_MODE.to_string();
         }
 
+        self.proxy_rules.dns_mode.clone_from(&self.dns_mode);
+
         if !warnings.is_empty() {
             for w in &warnings {
                 tracing::warn!("{w}");
@@ -625,6 +639,20 @@ impl AppConfig {
         self.control_token.clone_from(&running.control_token);
     }
 
+    pub fn network_policy(&self) -> localproxy_net::policy::NetworkPolicy {
+        use localproxy_net::{policy::NetworkPolicy, udp::UdpAction};
+
+        let upstream = self
+            .upstream
+            .active_server()
+            .map_or("", UpstreamServer::udp_proxy_type);
+        NetworkPolicy {
+            udp: self.proxy_rules.effective_udp_action(upstream),
+            ipv6: UdpAction::from_str_opt(&self.proxy_rules.ipv6_mode).unwrap_or(UdpAction::Block),
+            dns_direct: self.dns_mode == "direct",
+        }
+    }
+
     pub fn validate_desktop(&self) -> Result<(), String> {
         let mut config = self.clone();
         // 首选端口可以与已配置外部代理重合，桌面核心启动时会选择空闲端口。
@@ -636,6 +664,7 @@ impl AppConfig {
 
     pub fn listener_info(&self) -> ListenerInfo {
         ListenerInfo {
+            policy_path: None,
             listen_host: self.listen_host.clone(),
             socks5_port: self.socks5_port,
             http_port: self.http_port,
@@ -799,6 +828,17 @@ mod tests {
         let mut cfg = AppConfig::from_json_str(json).unwrap();
         cfg.sanitize();
         assert_eq!(cfg.upstream.servers[0].server_type, "http");
+    }
+
+    #[test]
+    fn legacy_dns_mode_is_used_only_when_top_level_mode_is_absent() {
+        let legacy = AppConfig::from_json_str(r#"{"proxy_rules":{"dns_mode":"direct"}}"#).unwrap();
+        assert!(legacy.network_policy().dns_direct);
+        let explicit =
+            AppConfig::from_json_str(r#"{"dns_mode":"proxy","proxy_rules":{"dns_mode":"direct"}}"#)
+                .unwrap();
+        assert!(!explicit.network_policy().dns_direct);
+        assert_eq!(explicit.proxy_rules.dns_mode, "proxy");
     }
 
     #[test]

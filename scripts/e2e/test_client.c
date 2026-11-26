@@ -15,6 +15,7 @@
 #include <poll.h>
 #include <errno.h>
 #include <netdb.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -55,6 +56,38 @@ static int udp_probe(const char *host, const char *port) {
     close(fd);
     freeaddrinfo(res);
     return 0;
+}
+
+/// 保留已连的 UDP socket，等待测试脚本切换策略后再尝试发送。
+static int udp_live_probe(void) {
+    int fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (fd < 0) {
+        return 1;
+    }
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(3478)};
+    inet_pton(AF_INET, "203.0.113.36", &addr.sin_addr);
+    if (connect(fd, (const struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        perror("UDP connect");
+        close(fd);
+        return 1;
+    }
+    puts("UDP_CONNECTED");
+    fflush(stdout);
+    if (getchar() == EOF) {
+        close(fd);
+        return 1;
+    }
+    // 若阻断回归，内核仍会拒绝无效缓冲区，测试不会发出公网报文。
+    struct iovec iov = {.iov_base = (void *)(uintptr_t)1, .iov_len = 1};
+    struct msghdr message = {.msg_iov = &iov, .msg_iovlen = 1};
+    ssize_t sent = sendmsg(fd, &message, 0);
+    int error = errno;
+    close(fd);
+    if (sent == -1 && error == ENETUNREACH) {
+        return 0;
+    }
+    fprintf(stderr, "已连接的 UDP socket 未按新策略阻断: sendmsg=%zd errno=%d\n", sent, error);
+    return 1;
 }
 
 /// DNS 探测：gethostbyname 打印 h_name 与首个地址（验证 FakeIP 覆盖旁路 API）。
@@ -197,6 +230,9 @@ static int udp_proxy_probe(const char *host, const char *port) {
 }
 
 int main(int argc, char **argv) {
+    if (argc >= 2 && strcmp(argv[1], "--udp-live") == 0) {
+        return udp_live_probe();
+    }
     if (argc >= 2 && strcmp(argv[1], "--udp") == 0) {
         const char *host = argc > 2 ? argv[2] : "example.com";
         const char *port = argc > 3 ? argv[3] : "3478";

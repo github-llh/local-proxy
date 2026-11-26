@@ -46,6 +46,9 @@ extern "C" {
         to: *const libc::sockaddr,
         tolen: libc::socklen_t,
     ) -> isize;
+    fn send(fd: c_int, msg: *const c_void, len: usize, flags: c_int) -> isize;
+    fn write(fd: c_int, msg: *const c_void, len: usize) -> isize;
+    fn writev(fd: c_int, iov: *const libc::iovec, count: c_int) -> isize;
     fn sendmsg(fd: c_int, msg: *const libc::msghdr, flags: c_int) -> isize;
     fn recvfrom(
         fd: c_int,
@@ -260,6 +263,62 @@ pub extern "C" fn localproxy_connect(
     }
 }
 
+/// 已连接的 UDP socket 也要按当前策略检查，避免沿用热切换前的直连状态。
+fn allow_connected_datagram(fd: RawFd) -> bool {
+    if !engine::is_installed() || unsafe { getsockopt_type(fd) } != Some(SOCK_DGRAM) {
+        return true;
+    }
+    let mut addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&addr) as libc::socklen_t;
+    let addr = (&mut addr as *mut libc::sockaddr_storage).cast();
+    if unsafe { libc::getpeername(fd, addr, &mut len) } != 0 {
+        return true;
+    }
+    if let Some(target) = unsafe { parse_sockaddr(addr, len) } {
+        match engine::proxy_udp(&target) {
+            engine::UdpOutcome::Direct => {}
+            engine::UdpOutcome::Blocked(error) => {
+                unsafe { set_errno(error.raw_os_error().unwrap_or(engine::ERR_NET_UNREACH)) };
+                return false;
+            }
+            engine::UdpOutcome::Proxy => {
+                // 旧直连 socket 无法原地切换为中继，要求应用重建连接。
+                unsafe { set_errno(engine::ERR_NET_UNREACH) };
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn check_connected_send(fd: RawFd) -> bool {
+    let Some(_guard) = engine::HookGuard::enter() else {
+        return true;
+    };
+    allow_connected_datagram(fd)
+}
+
+extern "C" fn localproxy_send(fd: RawFd, buf: *const c_void, len: usize, flags: c_int) -> isize {
+    if !check_connected_send(fd) {
+        return -1;
+    }
+    unsafe { send(fd, buf, len, flags) }
+}
+
+extern "C" fn localproxy_write(fd: RawFd, buf: *const c_void, len: usize) -> isize {
+    if !check_connected_send(fd) {
+        return -1;
+    }
+    unsafe { write(fd, buf, len) }
+}
+
+extern "C" fn localproxy_writev(fd: RawFd, iov: *const libc::iovec, count: c_int) -> isize {
+    if !check_connected_send(fd) {
+        return -1;
+    }
+    unsafe { writev(fd, iov, count) }
+}
+
 // ============= hook: sendto / sendmsg（UDP 封堵 P0.1） =============
 
 /// `sendto` 替换实现：公网 UDP 按 `udp_mode` 阻断（默认 block）。
@@ -278,9 +337,12 @@ pub extern "C" fn localproxy_sendto(
         return unsafe { sendto(fd, msg, len, flags, to, tolen) };
     };
 
-    // 无目标地址（connected socket 的 sendto 语义）：决策已在 connect hook 做出
     if to.is_null() {
-        return unsafe { sendto(fd, msg, len, flags, to, tolen) };
+        return if allow_connected_datagram(fd) {
+            unsafe { sendto(fd, msg, len, flags, to, tolen) }
+        } else {
+            -1
+        };
     }
     // SAFETY: 调用方保证 to/tolen 有效
     let Some(target) = (unsafe { parse_sockaddr(to, tolen) }) else {
@@ -347,8 +409,11 @@ pub extern "C" fn localproxy_sendmsg(fd: RawFd, msg: *const libc::msghdr, flags:
     // SAFETY: 调用方保证 msg 有效
     let m = unsafe { &*msg };
     if m.msg_name.is_null() {
-        // connected socket：决策已在 connect hook 做出
-        return unsafe { sendmsg(fd, msg, flags) };
+        return if allow_connected_datagram(fd) {
+            unsafe { sendmsg(fd, msg, flags) }
+        } else {
+            -1
+        };
     }
     // SAFETY: msg_name/msg_namelen 构成有效 sockaddr
     let Some(target) =
@@ -806,7 +871,8 @@ pub extern "C" fn localproxy_getnameinfo(
         _ => None,
     };
     let Some(domain) = fake_domain else {
-        let flags = if !host.is_null()
+        let flags = if !engine::dns_direct()
+            && !host.is_null()
             && target
                 .as_ref()
                 .is_some_and(|addr| !engine::should_bypass(addr))
@@ -883,6 +949,27 @@ static INTERPOSE_CONNECT: InterposePair = InterposePair {
 static INTERPOSE_GETADDRINFO: InterposePair = InterposePair {
     replacement: localproxy_getaddrinfo as *const c_void,
     original: getaddrinfo as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_WRITEV: InterposePair = InterposePair {
+    replacement: localproxy_writev as *const c_void,
+    original: writev as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_WRITE: InterposePair = InterposePair {
+    replacement: localproxy_write as *const c_void,
+    original: write as *const c_void,
+};
+
+#[link_section = "__DATA,__interpose"]
+#[used]
+static INTERPOSE_SEND: InterposePair = InterposePair {
+    replacement: localproxy_send as *const c_void,
+    original: send as *const c_void,
 };
 
 #[link_section = "__DATA,__interpose"]

@@ -21,7 +21,8 @@ use localproxy_net::fakeip::FakeIp;
 use localproxy_net::local_target;
 use localproxy_net::socks5::{self, consts, ProxyAuth, Timeouts};
 
-use crate::config::{Ipv6Mode, ShimConfig, ShimMode, UdpMode};
+use crate::config::{ShimConfig, ShimMode};
+use localproxy_net::udp::UdpAction;
 
 /// 全局配置（首次 install 后不变）。
 static CONFIG: std::sync::OnceLock<ShimConfig> = std::sync::OnceLock::new();
@@ -166,9 +167,21 @@ pub fn should_bypass(addr: &SocketAddr) -> bool {
     }
 }
 
+fn is_mdns_target(addr: &SocketAddr) -> bool {
+    addr.port() == 5353
+        && match addr.ip() {
+            std::net::IpAddr::V4(ip) => ip == Ipv4Addr::new(224, 0, 0, 251),
+            std::net::IpAddr::V6(ip) => ip.segments() == [0xff02, 0, 0, 0, 0, 0, 0, 0xfb],
+        }
+}
+
 /// 域名是否应该分配 FakeIP（排除回环/本地域名）。
 pub fn should_fakeip(node: &str) -> bool {
-    !local_target::should_bypass_proxy_host(node)
+    !local_target::should_bypass_proxy_host(node) && !dns_direct()
+}
+
+pub fn dns_direct() -> bool {
+    config().network_policy().dns_direct
 }
 
 /// 由 service 字符串解析端口（"80"/"http"/NULL）。
@@ -247,10 +260,10 @@ pub fn check_ipv6_policy(target: &SocketAddr) -> std::io::Result<bool> {
     if is_private_ipv6(ip) || ip.is_loopback() {
         return Ok(false); // 内网/回环 v6 直连
     }
-    match config().ipv6_mode {
-        Ipv6Mode::Block => Err(ipv6_blocked_error()),
-        Ipv6Mode::Direct => Ok(false),
-        Ipv6Mode::Proxy => Ok(true),
+    match config().network_policy().ipv6 {
+        UdpAction::Block => Err(ipv6_blocked_error()),
+        UdpAction::Direct => Ok(false),
+        UdpAction::Proxy => Ok(true),
     }
 }
 
@@ -260,7 +273,7 @@ pub fn check_ipv6_policy(target: &SocketAddr) -> std::io::Result<bool> {
 /// - 回环/私网/mDNS → `Direct`（正常应用行为不受影响）
 /// - `udp_mode=direct` → `Direct`
 /// - `udp_mode=block`（默认）→ `Blocked`（`ENETUNREACH` 促使应用回退 TCP）
-/// - `udp_mode=proxy` → `Proxy`（S2 实现；当前回落 Blocked 并记录）
+/// - `udp_mode=proxy` → `Proxy`（由平台 shim 交给核心处理）
 #[derive(Debug)]
 pub enum UdpOutcome {
     /// 放行原始 sendto
@@ -276,12 +289,16 @@ pub fn proxy_udp(target: &SocketAddr) -> UdpOutcome {
     if cfg.mode == ShimMode::Direct || !is_installed() {
         return UdpOutcome::Direct;
     }
-    if should_bypass(target) {
+    if should_bypass(target) || is_mdns_target(target) {
         return UdpOutcome::Direct;
     }
-    match cfg.udp_mode {
-        UdpMode::Direct => UdpOutcome::Direct,
-        UdpMode::Block => {
+    let policy = cfg.network_policy();
+    if target.is_ipv6() && policy.ipv6 == UdpAction::Block {
+        return UdpOutcome::Blocked(ipv6_blocked_error());
+    }
+    match policy.udp {
+        UdpAction::Direct => UdpOutcome::Direct,
+        UdpAction::Block => {
             tracing::debug!(
                 "shim: UDP block {}:{}（回退 TCP 信号）",
                 target.ip(),
@@ -289,7 +306,7 @@ pub fn proxy_udp(target: &SocketAddr) -> UdpOutcome {
             );
             UdpOutcome::Blocked(udp_blocked_error())
         }
-        UdpMode::Proxy => UdpOutcome::Proxy,
+        UdpAction::Proxy => UdpOutcome::Proxy,
     }
 }
 
@@ -343,6 +360,9 @@ pub fn proxy_connect(io: &dyn SockIo, fd: i64, target: &SocketAddr) -> std::io::
 /// （关闭即关联终止），由调用方持有并在会话结束时 `raw_close`。
 pub fn core_udp_associate(io: &dyn SockIo) -> std::io::Result<(i64, SocketAddr)> {
     let cfg = config();
+    if !cfg.core_is_alive() {
+        return Err(std::io::ErrorKind::ConnectionRefused.into());
+    }
     let core = io.core_addr().ok_or_else(|| {
         std::io::Error::other(format!("核心地址解析失败: {}", cfg.core_endpoint()))
     })?;
@@ -460,6 +480,10 @@ pub fn core_udp_associate(io: &dyn SockIo) -> std::io::Result<(i64, SocketAddr)>
 /// 在原 fd 上连接本地核心并完成 SOCKS5 协商。
 fn dial_core_in_place(io: &dyn SockIo, fd: i64, host: &str, port: u16) -> std::io::Result<()> {
     let cfg = config();
+    // 核心退出后，旧端口可能已分配给其他服务。
+    if !cfg.core_is_alive() {
+        return Err(std::io::ErrorKind::ConnectionRefused.into());
+    }
     let core = io.core_addr().ok_or_else(|| {
         std::io::Error::other(format!("核心地址解析失败: {}", cfg.core_endpoint()))
     })?;

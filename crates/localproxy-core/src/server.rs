@@ -8,24 +8,32 @@
 //! 拒绝时返回对应协议的错误响应（SOCKS5 REPLY 码 / HTTP 状态码）。
 
 use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+};
+use std::{io::Write, path::PathBuf};
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
 use localproxy_net::socks5::{self, consts, reply_to_text, Timeouts};
+use localproxy_net::udp::UdpAction;
 
 use crate::config::{AppConfig, UpstreamServer};
 use crate::diagnostics::{self, ConnectionLog, ConnectionRecord};
 use crate::managed::ManagedRuntime;
-use crate::rules::{Action, RuleEngine};
+use crate::rules::{Action, RouteDecision, RuleEngine};
 use crate::stats::Stats;
-use crate::upstream::{Upstream, UpstreamError};
+use crate::upstream::{UdpSession, Upstream, UpstreamError};
 
 /// 服务共享上下文。
 pub struct ServerContext {
     /// 新连接从同一份快照读取配置与编译后的规则。
     pub(crate) settings: tokio::sync::RwLock<Arc<RuntimeSettings>>,
     pub(crate) reload_lock: tokio::sync::Mutex<()>,
+    _policy_lease: Option<std::fs::File>,
+    policy_directory: Option<tempfile::TempDir>,
     /// 统计
     pub stats: Arc<Stats>,
     /// 连接诊断日志（环形缓冲）
@@ -93,18 +101,55 @@ impl ServerContext {
     }
 
     pub async fn start(config: AppConfig) -> Result<Self, String> {
-        Ok(Self::from_settings(
-            RuntimeSettings::prepare(config, None).await?,
-        ))
+        let settings = RuntimeSettings::prepare(config, None).await?;
+        let mut ctx = Self::from_settings(settings);
+        let directory = tempfile::Builder::new()
+            .prefix("localproxy-policy-")
+            .tempdir()
+            .map_err(|error| format!("创建策略目录失败: {error}"))?;
+        let lease = std::fs::File::create(
+            directory
+                .path()
+                .join(localproxy_net::policy::POLICY_LEASE_FILENAME),
+        )
+        .map_err(|error| format!("创建策略租约失败: {error}"))?;
+        lease
+            .lock()
+            .map_err(|error| format!("锁定策略租约失败: {error}"))?;
+        ctx._policy_lease = Some(lease);
+        ctx.policy_directory = Some(directory);
+        ctx.publish_policy(&ctx.settings.read().await.config)?;
+        Ok(ctx)
     }
 
     fn from_settings(settings: RuntimeSettings) -> Self {
         Self {
             settings: tokio::sync::RwLock::new(Arc::new(settings)),
             reload_lock: tokio::sync::Mutex::new(()),
+            policy_directory: None,
+            _policy_lease: None,
             stats: Arc::new(Stats::new()),
             connections: Arc::new(ConnectionLog::with_default_capacity()),
         }
+    }
+
+    pub fn policy_path(&self) -> Option<PathBuf> {
+        self.policy_directory
+            .as_ref()
+            .map(|directory| directory.path().join("active"))
+    }
+
+    pub(crate) fn publish_policy(&self, config: &AppConfig) -> Result<(), String> {
+        if let Some(directory) = &self.policy_directory {
+            let result = (|| -> std::io::Result<()> {
+                let mut next = tempfile::NamedTempFile::new_in(directory.path())?;
+                next.write_all(config.network_policy().encode().as_bytes())?;
+                next.persist(directory.path().join("active"))?;
+                Ok(())
+            })();
+            result.map_err(|error| format!("更新运行期策略失败: {error}"))?;
+        }
+        Ok(())
     }
 
     /// 记录一条连接（诊断日志）。
@@ -369,33 +414,27 @@ async fn handle_udp_associate(
         return;
     }
 
-    // 保持独立内核存活到本 UDP 关联结束。
-    let settings = ctx.settings.read().await.clone();
-    let Some(server) = settings.active_proxy() else {
-        let _ = send_socks5_reply(&mut control, 0x01).await;
-        return;
-    };
-    if settings
-        .config
-        .proxy_rules
-        .effective_udp_action(server.udp_proxy_type())
-        != localproxy_net::udp::UdpAction::Proxy
-    {
+    // 已建立的代理关联保留原上游的生命周期，报文按最新配置分流。
+    let initial = ctx.settings.read().await.clone();
+    let udp = initial.config.network_policy().udp;
+    if udp == UdpAction::Block {
         let _ = send_socks5_reply(&mut control, 0x02).await;
         return;
     }
-    let mut upstream = match Upstream::new(server, ServerContext::timeouts())
-        .udp_associate()
-        .await
-    {
-        Ok(session) => session,
-        Err(error) => {
-            tracing::debug!("UDP 上游会话建立失败: {error}");
-            let reply = dispatch_error_to_reply(&error.into());
-            let _ = send_socks5_reply(&mut control, reply).await;
-            return;
+    let mut upstream = None;
+    if udp == UdpAction::Proxy {
+        match open_udp_upstream(initial.clone()).await {
+            Ok(session) => upstream = Some(session),
+            Err(error) if initial.has_explicit_udp_direct() => {
+                tracing::debug!("UDP 上游不可用，仍处理显式直连规则: {error}");
+            }
+            Err(error) => {
+                let reply = dispatch_error_to_reply(&error);
+                let _ = send_socks5_reply(&mut control, reply).await;
+                return;
+            }
         }
-    };
+    }
     let relay_socket = match control.local_addr() {
         Ok(addr) => tokio::net::UdpSocket::bind((addr.ip(), 0)).await,
         Err(error) => Err(error),
@@ -420,46 +459,258 @@ async fn handle_udp_associate(
         return;
     }
     ctx.stats.on_connect_started();
-    ctx.record_connection("udp", "associate", 0, "proxy", "", "ok", "");
-
     let mut client_addr = None;
     let mut from_client = vec![0; 65536];
     let mut from_upstream = vec![0; 65536];
+    let mut from_direct = vec![0; 65536];
+    let mut from_direct_v6 = vec![0; 65536];
     let mut client_control = [0];
     let mut upstream_control = [0];
+    let mut direct = DirectUdp::default();
     loop {
+        let (upstream_tcp, upstream_udp) = match upstream.as_mut() {
+            Some(proxy) => (
+                Some(&mut proxy.session.control),
+                Some(&proxy.session.socket),
+            ),
+            None => (None, None),
+        };
         tokio::select! {
             _ = control.read(&mut client_control) => break,
-            _ = upstream.control.read(&mut upstream_control) => break,
+            _ = read_optional(upstream_tcp, &mut upstream_control) => {
+                upstream = None;
+            }
             packet = relay.recv_from(&mut from_client) => {
                 let Ok((len, addr)) = packet else { break };
                 if addr.ip() != peer.ip() || client_addr.is_some_and(|client| client != addr) {
                     continue;
                 }
                 let data = &from_client[..len];
-                let Some((_, port, _)) = socks5::decode_udp_packet(data) else { continue };
-                if !ctx.settings.read().await.config.proxy_rules.is_port_allowed(port) {
-                    continue;
-                }
+                let Some((host, port, payload)) = socks5::decode_udp_packet(data) else { continue };
+                let current = ctx.settings.read().await.clone();
+                let Some(decision) = current.udp_route(&host, port) else { continue };
                 client_addr = Some(addr);
-                if let Err(error) = upstream.socket.send(data).await {
-                    tracing::debug!("UDP 上游发送失败: {error}");
-                    break;
+                let sent = match decision.action {
+                    Action::Direct => {
+                        let ipv6 = current.config.network_policy().ipv6 != UdpAction::Block;
+                        direct.send(ctx, &host, port, payload, ipv6).await
+                    }
+                    Action::Proxy => {
+                        if upstream.is_none() {
+                            match open_udp_upstream(current.clone()).await {
+                                Ok(session) => upstream = Some(session),
+                                Err(error) => {
+                                    tracing::debug!("UDP 上游会话建立失败: {error}");
+                                    continue;
+                                }
+                            }
+                        }
+                        let settings = ctx.settings.read().await;
+                        if !settings.allows_udp_action(&host, port, Action::Proxy) {
+                            continue;
+                        }
+                        let socket = &upstream.as_ref().expect("上游已建立").session.socket;
+                        match tokio::time::timeout(ServerContext::timeouts().send_timeout(), socket.send(data)).await {
+                            Ok(result) => result,
+                            Err(error) => Err(error.into()),
+                        }
+                    }
+                };
+                if let Err(error) = sent {
+                    ctx.record_connection("udp", &host, port, decision.action.name(), &decision.rule, "failed", &error.to_string());
                 }
             }
-            packet = upstream.socket.recv(&mut from_upstream) => {
-                let Ok(len) = packet else { break };
+            packet = recv_optional(upstream_udp, &mut from_upstream) => {
+                let Ok((len, _)) = packet else {
+                    upstream = None;
+                    continue;
+                };
                 let data = &from_upstream[..len];
+                let Some((_, port, _)) = socks5::decode_udp_packet(data) else { continue };
+                let current = ctx.settings.read().await;
+                if current.config.network_policy().udp == UdpAction::Block
+                    || !current.config.proxy_rules.is_port_allowed(port) {
+                    continue;
+                }
                 if let Some(addr) = client_addr {
-                    if socks5::decode_udp_packet(data).is_some() && relay.send_to(data, addr).await.is_err() {
-                        break;
-                    }
+                    let _ = tokio::time::timeout(ServerContext::timeouts().send_timeout(), relay.send_to(data, addr)).await;
+                }
+            }
+            packet = recv_optional(direct.ipv4.as_ref(), &mut from_direct) => {
+                if let Ok((len, source)) = packet {
+                    direct.forward_reply(ctx, &relay, client_addr, source, &from_direct[..len]).await;
+                }
+            }
+            packet = recv_optional(direct.ipv6.as_ref(), &mut from_direct_v6) => {
+                if let Ok((len, source)) = packet {
+                    direct.forward_reply(ctx, &relay, client_addr, source, &from_direct_v6[..len]).await;
                 }
             }
         }
     }
     ctx.stats.on_connect_finished();
     tracing::debug!("UDP ASSOCIATE {peer} 结束");
+}
+
+impl RuntimeSettings {
+    fn has_explicit_udp_direct(&self) -> bool {
+        self.config.routing.default_action == "direct"
+            || (self.config.routing.enabled
+                && self.config.routing.rules.iter().any(|rule| {
+                    rule.enabled
+                        && rule.action == "direct"
+                        && (rule.protocols.is_empty() || rule.protocols.iter().any(|p| p == "udp"))
+                }))
+    }
+
+    fn udp_route(&self, host: &str, port: u16) -> Option<RouteDecision> {
+        if !self.config.proxy_rules.is_port_allowed(port) {
+            return None;
+        }
+        let policy = self.config.network_policy();
+        if policy.ipv6 == UdpAction::Block && host.parse::<IpAddr>().is_ok_and(|ip| ip.is_ipv6()) {
+            return None;
+        }
+        match policy.udp {
+            UdpAction::Block => None,
+            UdpAction::Direct => Some(RouteDecision {
+                action: Action::Direct,
+                rule: String::new(),
+            }),
+            UdpAction::Proxy => Some(self.rules.decide(host, None, port, "udp")),
+        }
+    }
+
+    fn allows_udp_action(&self, host: &str, port: u16, action: Action) -> bool {
+        self.udp_route(host, port)
+            .is_some_and(|decision| decision.action == action)
+    }
+}
+
+struct ProxyUdp {
+    session: UdpSession,
+    // 关联仍持有原内核，新关联才切换到新上游。
+    _settings: Arc<RuntimeSettings>,
+}
+
+async fn open_udp_upstream(settings: Arc<RuntimeSettings>) -> Result<ProxyUdp, DispatchError> {
+    let server = settings
+        .active_proxy()
+        .ok_or_else(|| DispatchError::Protocol("无可用上游".to_string()))?;
+    let session = Upstream::new(server, ServerContext::timeouts())
+        .udp_associate()
+        .await?;
+    Ok(ProxyUdp {
+        session,
+        _settings: settings,
+    })
+}
+
+async fn read_optional(stream: Option<&mut TcpStream>, buf: &mut [u8]) -> std::io::Result<usize> {
+    match stream {
+        Some(stream) => stream.read(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn recv_optional(
+    socket: Option<&UdpSocket>,
+    buf: &mut [u8],
+) -> std::io::Result<(usize, SocketAddr)> {
+    match socket {
+        Some(socket) => socket.recv_from(buf).await,
+        None => std::future::pending().await,
+    }
+}
+
+#[derive(Default)]
+struct DirectUdp {
+    ipv4: Option<UdpSocket>,
+    ipv6: Option<UdpSocket>,
+    /// 只把明确发送过的目标的回包交还客户端。
+    peers: HashMap<SocketAddr, String>,
+}
+
+impl DirectUdp {
+    async fn send(
+        &mut self,
+        ctx: &ServerContext,
+        host: &str,
+        port: u16,
+        data: &[u8],
+        ipv6: bool,
+    ) -> std::io::Result<usize> {
+        const MAX_DIRECT_PEERS: usize = 128;
+        let target = if let Ok(ip) = host.parse::<IpAddr>() {
+            SocketAddr::new(ip, port)
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                tokio::net::lookup_host((host, port)),
+            )
+            .await??
+            .find(|addr| ipv6 || addr.is_ipv4())
+            .ok_or(std::io::ErrorKind::AddrNotAvailable)?
+        };
+        if self.peers.len() >= MAX_DIRECT_PEERS && !self.peers.contains_key(&target) {
+            return Err(std::io::Error::other("UDP 直连会话目标数达到上限"));
+        }
+        let socket = if target.is_ipv4() {
+            &mut self.ipv4
+        } else {
+            &mut self.ipv6
+        };
+        if socket.is_none() {
+            let bind = if target.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            *socket = Some(UdpSocket::bind(bind).await?);
+        }
+        // DNS 解析和 bind 可能跨过一次热重载，实际发送前重新确认策略。
+        let settings = ctx.settings.read().await;
+        if !settings.allows_udp_action(host, port, Action::Direct)
+            || (target.is_ipv6() && settings.config.network_policy().ipv6 == UdpAction::Block)
+        {
+            return Err(std::io::ErrorKind::PermissionDenied.into());
+        }
+        let socket = socket.as_ref().expect("直连 socket 已绑定");
+        let size = tokio::time::timeout(
+            ServerContext::timeouts().send_timeout(),
+            socket.send_to(data, target),
+        )
+        .await??;
+        self.peers.insert(target, host.to_string());
+        Ok(size)
+    }
+
+    async fn forward_reply(
+        &self,
+        ctx: &ServerContext,
+        relay: &UdpSocket,
+        client: Option<SocketAddr>,
+        source: SocketAddr,
+        data: &[u8],
+    ) {
+        let (Some(client), Some(host)) = (client, self.peers.get(&source)) else {
+            return;
+        };
+        let settings = ctx.settings.read().await;
+        if !settings.allows_udp_action(host, source.port(), Action::Direct)
+            || (source.is_ipv6() && settings.config.network_policy().ipv6 == UdpAction::Block)
+        {
+            return;
+        }
+        if let Ok(packet) = socks5::encode_udp_packet(&source.ip().to_string(), source.port(), data)
+        {
+            let _ = tokio::time::timeout(
+                ServerContext::timeouts().send_timeout(),
+                relay.send_to(&packet, client),
+            )
+            .await;
+        }
+    }
 }
 
 /// 读取 SOCKS5 请求的 ATYP + ADDR + PORT。
@@ -600,7 +851,6 @@ async fn handle_http(mut stream: TcpStream, peer: std::net::SocketAddr, ctx: Arc
 mod tests {
     use super::*;
     use crate::config::UpstreamSettings;
-    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1040,5 +1290,67 @@ mod tests {
         control.read_exact(&mut reply).await.unwrap();
         assert_eq!(&reply[..2], &[5, 2]);
         upstream_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_direct_rule_is_applied_and_running_association_respects_block() {
+        let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let unavailable = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = config_with_upstream(unavailable.local_addr().unwrap());
+        drop(unavailable);
+        config.routing.use_default_private = false;
+        config.proxy_rules.allowed_ports = vec![target_addr.port()];
+        config.routing.rules.push(crate::config::RoutingRule {
+            name: "UDP 局部直连".to_string(),
+            action: "direct".to_string(),
+            domains: vec!["127.0.0.1".to_string()],
+            ports: vec![target_addr.port().to_string()],
+            protocols: vec!["udp".to_string()],
+            ..Default::default()
+        });
+        let (core, ctx) = start_core(config.clone()).await;
+        let mut control = TcpStream::connect(core).await.unwrap();
+        control.write_all(&[5, 1, 0]).await.unwrap();
+        let mut method = [0; 2];
+        control.read_exact(&mut method).await.unwrap();
+        assert_eq!(method, [5, 0]);
+        control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .await
+            .unwrap();
+        let mut reply = [0; 10];
+        control.read_exact(&mut reply).await.unwrap();
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay = SocketAddr::new(core.ip(), u16::from_be_bytes([reply[8], reply[9]]));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let packet = socks5::encode_udp_packet("127.0.0.1", target_addr.port(), b"direct").unwrap();
+        client.send_to(&packet, relay).await.unwrap();
+        let mut buffer = [0; 128];
+        let (len, source) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            target.recv_from(&mut buffer),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(&buffer[..len], b"direct");
+        target.send_to(b"reply", source).await.unwrap();
+        let len = tokio::time::timeout(std::time::Duration::from_secs(1), client.recv(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, _, payload) = socks5::decode_udp_packet(&buffer[..len]).unwrap();
+        assert_eq!(payload, b"reply");
+
+        config.proxy_rules.udp_mode = "block".to_string();
+        *ctx.settings.write().await = Arc::new(RuntimeSettings::new(config));
+        client.send_to(&packet, relay).await.unwrap();
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            target.recv(&mut buffer)
+        )
+        .await
+        .is_err());
     }
 }

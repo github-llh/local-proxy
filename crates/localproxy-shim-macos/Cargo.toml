@@ -9,7 +9,7 @@ description = "LocalProxy macOS 注入 shim：DYLD_INSERT_LIBRARIES + __interpos
 crate-type = ["cdylib"]
 path = "src/lib.rs"
 
-[dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 localproxy-shim = { workspace = true }
 localproxy-net = { workspace = true }
 libc = "0.2"

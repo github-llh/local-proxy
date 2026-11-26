@@ -63,8 +63,13 @@ pub struct ProcessInfo {
 
 impl ProcessInfo {
     /// 恢复主线程。
-    pub fn resume(&self) {
-        unsafe { ResumeThread(self.thread) };
+    pub fn resume(&self) -> Result<(), InjectError> {
+        if unsafe { ResumeThread(self.thread) } == u32::MAX {
+            return Err(InjectError::Spawn(
+                std::io::Error::last_os_error().to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// 终止并关闭句柄。
@@ -88,7 +93,7 @@ pub fn to_wide(path: &Path) -> Vec<u16> {
 /// 构造环境变量块（按 key 大写排序，`K=V\0`，双 NUL 结尾）。
 pub fn build_env_block(pairs: &[(String, String)]) -> Vec<u16> {
     let mut sorted: Vec<&(String, String)> = pairs.iter().collect();
-    sorted.sort_by(|a, b| a.0.to_uppercase().cmp(&b.0.to_uppercase()));
+    sorted.sort_by_cached_key(|entry| entry.0.to_uppercase());
     let mut block: Vec<u16> = Vec::new();
     for (k, v) in sorted {
         let entry = format!("{k}={v}");

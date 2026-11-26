@@ -145,7 +145,7 @@ pub fn list_sessions(state: State<'_, AppState>) -> Vec<SessionInfo> {
         .map(|s: &AppSession| SessionInfo {
             entry_id: s.entry_id.clone(),
             entry_name: s.entry_name.clone(),
-            pid: s.pid,
+            pid: s.pid(),
             uptime_secs: s.started_at.elapsed().as_secs(),
         })
         .collect()
@@ -191,60 +191,39 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             .ok_or_else(|| "应用不存在或已禁用".to_string())?
     };
     spawn_core(&state)?;
-    let (core_host, core_port, fakeip_cidr, udp_mode, ipv6_mode) = {
-        let config = state.config.lock().map_err(|e| e.to_string())?;
-        // 安全策略由 core 配置解析：udp_mode × 上游类型 → 有效动作
-        let upstream_type = config
-            .upstream
-            .active_server()
-            .map(UpstreamServer::udp_proxy_type)
-            .unwrap_or_default();
-        let udp = config
-            .proxy_rules
-            .effective_udp_action(upstream_type)
-            .name()
-            .to_string();
+    let (core_addr, policy_path) = {
         let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-        let listeners = running_core(&mut guard).map_or(&*config, |core| &core.startup_config);
-        (
-            listeners.listen_host.clone(),
-            listeners.socks5_port,
-            "198.18.0.0/15".to_string(),
-            udp,
-            config.proxy_rules.ipv6_mode.clone(),
-        )
+        let running = running_core(&mut guard).ok_or("LocalProxy 核心已退出")?;
+        let core_addr = running
+            .startup_config
+            .socks5_endpoint()
+            .parse()
+            .map_err(|e| format!("核心地址无效: {e}"))?;
+        (core_addr, running.policy_path.clone())
+    };
+    let launch = localproxy_launcher::LaunchConfig {
+        core: core_addr,
+        policy_path: &policy_path,
     };
 
     let shim = shim_binary_path();
     if !shim.exists() {
-        return Err(format!(
-            "shim 不存在: {}（开发模式请先 cargo build -p localproxy-shim-macos）",
-            shim.display()
-        ));
+        return Err(format!("找不到当前平台的代理 shim: {}", shim.display()));
     }
 
-    // 平台分发
-    let session = launch_via_platform(
-        &entry,
-        &shim,
-        &core_host,
-        core_port,
-        &fakeip_cidr,
-        &udp_mode,
-        &ipv6_mode,
-    )?;
-
+    let mut sessions = state.sessions.lock().map_err(|error| error.to_string())?;
+    if sessions.iter().any(|session| session.entry_id == entry.id) {
+        return Err("应用已在运行".to_string());
+    }
+    let session = launch_via_platform(&entry, &shim, &launch)?;
     let info = SessionInfo {
         entry_id: session.entry_id.clone(),
         entry_name: session.entry_name.clone(),
-        pid: session.pid,
+        pid: session.pid(),
         uptime_secs: 0,
     };
-    state
-        .sessions
-        .lock()
-        .map_err(|e| e.to_string())?
-        .push(session);
+    sessions.push(session);
+    drop(sessions);
 
     // 记录最近启动时间（「最近使用」排序）
     {
@@ -388,64 +367,19 @@ pub async fn test_upstream(
     })
 }
 
-/// 平台启动分发（macOS：DYLD 注入；Windows：挂起进程 + DLL 注入）。
-#[cfg(target_os = "macos")]
+/// 启动后保留系统进程句柄，停止和清理均不按裸 PID 查找。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn launch_via_platform(
     entry: &AppEntry,
     shim: &Path,
-    core_host: &str,
-    core_port: u16,
-    fakeip_cidr: &str,
-    udp_mode: &str,
-    ipv6_mode: &str,
-) -> Result<crate::state::AppSession, String> {
-    use localproxy_launcher::macos;
-
-    let session = macos::launch(
-        entry,
-        shim,
-        core_host,
-        core_port,
-        fakeip_cidr,
-        udp_mode,
-        ipv6_mode,
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(crate::state::AppSession {
-        entry_id: session.entry_id,
+    config: &localproxy_launcher::LaunchConfig<'_>,
+) -> Result<AppSession, String> {
+    let process =
+        localproxy_launcher::launch(entry, shim, config).map_err(|error| error.to_string())?;
+    Ok(AppSession {
+        entry_id: entry.id.clone(),
         entry_name: entry.name.clone(),
-        pid: session.child.id(),
-        started_at: std::time::Instant::now(),
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn launch_via_platform(
-    entry: &AppEntry,
-    shim: &Path,
-    core_host: &str,
-    core_port: u16,
-    fakeip_cidr: &str,
-    udp_mode: &str,
-    ipv6_mode: &str,
-) -> Result<crate::state::AppSession, String> {
-    use localproxy_launcher::windows;
-
-    let session = windows::launch(
-        entry,
-        shim,
-        core_host,
-        core_port,
-        fakeip_cidr,
-        udp_mode,
-        ipv6_mode,
-    )
-    .map_err(|e| e.to_string())?;
-    let pid = session.pid();
-    Ok(crate::state::AppSession {
-        entry_id: session.entry_id,
-        entry_name: entry.name.clone(),
-        pid,
+        process,
         started_at: std::time::Instant::now(),
     })
 }
@@ -454,38 +388,22 @@ fn launch_via_platform(
 fn launch_via_platform(
     _entry: &AppEntry,
     _shim: &Path,
-    _core_host: &str,
-    _core_port: u16,
-    _fakeip_cidr: &str,
-    _udp_mode: &str,
-    _ipv6_mode: &str,
-) -> Result<crate::state::AppSession, String> {
+    _config: &localproxy_launcher::LaunchConfig<'_>,
+) -> Result<AppSession, String> {
     Err("当前平台不支持启动注入".to_string())
 }
 
-/// 停止运行中的应用（按 entry id）。
 #[tauri::command]
 pub fn stop_app(state: State<'_, AppState>, id: String) -> Result<(), String> {
     let mut sessions = state.sessions.lock().map_err(|e| e.to_string())?;
-    let target = sessions.iter().find(|s| s.entry_id == id).map(|s| s.pid);
-    let Some(pid) = target else {
-        return Err("应用未在运行".to_string());
-    };
-    // Unix：杀进程组（launcher 启动时置于独立进程组，.app 子进程一并终止）；
-    // Windows：taskkill /T 树杀
-    #[cfg(unix)]
-    {
-        // SAFETY: pid 来自本进程启动的子进程（进程组组长）
-        unsafe { libc::kill(-(pid as i32), libc::SIGTERM) };
-    }
-    #[cfg(not(unix))]
-    {
-        // Windows: 用 taskkill 兜底（M4 换 TerminateProcess）
-        let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .output();
-    }
-    sessions.retain(|s| s.entry_id != id);
+    sessions.retain_mut(AppSession::is_running);
+    let session = sessions
+        .iter_mut()
+        .find(|session| session.entry_id == id)
+        .ok_or("应用未在运行")?;
+    session
+        .stop()
+        .map_err(|error| format!("停止应用失败: {error}"))?;
     Ok(())
 }
 
@@ -587,45 +505,9 @@ pub async fn select_clash_proxy(
         .await
 }
 
-/// 清理已退出的会话（按 pid 存活判断）。
+/// 清理已退出的会话。
 fn prune_sessions(state: &AppState) {
-    let mut sessions = match state.sessions.lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    sessions.retain(|s| pid_alive(s.pid));
-}
-
-/// pid 是否存活。
-fn pid_alive(pid: u32) -> bool {
-    #[cfg(unix)]
-    {
-        // SAFETY: kill(pid, 0) 仅探测存在性
-        let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
-        alive || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(windows)]
-    {
-        use windows::Win32::Foundation::CloseHandle;
-        use windows::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        // SAFETY: OpenProcess 失败返回 NULL
-        let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) };
-        match process {
-            Ok(h) if !h.is_invalid() => {
-                let mut code = 0u32;
-                let ok = unsafe { GetExitCodeProcess(h, &mut code) };
-                let _ = unsafe { CloseHandle(h) };
-                // STILL_ACTIVE = 259
-                ok.is_ok() && code == 259
-            }
-            _ => false,
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = pid;
-        true
+    if let Ok(mut sessions) = state.sessions.lock() {
+        sessions.retain_mut(AppSession::is_running);
     }
 }

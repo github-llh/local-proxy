@@ -98,8 +98,7 @@ cd src-tauri && ../ui/node_modules/.bin/tauri dev
 cargo run -p localproxy-core
 curl -x socks5://127.0.0.1:1080 https://example.com   # 另一个终端
 
-# 一键自检（注入链路 14 组断言：UDP 封堵/放行、DNS 零泄露、
-# FakeIP、非阻塞 connect、UDP 全代理、未注入对照）
+# macOS 一键自检（FakeIP、非阻塞 TCP、UDP 阻断/放行和 SOCKS5 中继）
 scripts/e2e/inject-e2e.sh
 ```
 

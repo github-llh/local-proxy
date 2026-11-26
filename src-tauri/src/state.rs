@@ -15,14 +15,51 @@ pub struct CoreProcess {
     pub child: Child,
     pub started_at: std::time::Instant,
     pub startup_config: AppConfig,
+    pub policy_path: PathBuf,
 }
 
 /// 一个被代理应用的运行会话。
 pub struct AppSession {
     pub entry_id: String,
     pub entry_name: String,
-    pub pid: u32,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub process: localproxy_launcher::Session,
     pub started_at: std::time::Instant,
+}
+
+impl AppSession {
+    pub fn pid(&self) -> u32 {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.process.pid()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            0
+        }
+    }
+
+    pub fn is_running(&mut self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.process.is_running()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            false
+        }
+    }
+
+    pub fn stop(&mut self) -> std::io::Result<()> {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.process.kill()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    }
 }
 
 /// 应用全局状态。
@@ -117,65 +154,41 @@ pub fn default_config_path() -> PathBuf {
         .join("config.json")
 }
 
-/// 本地核心二进制路径。
-///
-/// - dev（debug_assertions）：workspace target/debug/localproxy-core
-/// - release：与 App 可执行文件同目录（打包时 sidecar 放置处）
+/// 安装包与开发构建使用同名核心和 shim。
 pub fn core_binary_path() -> PathBuf {
-    let name = if cfg!(windows) {
+    packaged_or_development(if cfg!(windows) {
         "localproxy-core.exe"
     } else {
         "localproxy-core"
-    };
-    if cfg!(debug_assertions) {
-        // 仓库根/target/debug/localproxy-core
-        let exe = std::env::current_exe().unwrap_or_default();
-        // target/debug/localproxy-app → 上三级为仓库根
-        let root = exe
-            .ancestors()
-            .nth(3)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        root.join("target/debug").join(name)
-    } else {
-        let exe = std::env::current_exe().unwrap_or_default();
-        exe.with_file_name(name)
-    }
+    })
 }
 
-/// shim 二进制路径（macOS：target/debug 或 App Resources；Windows：App 同目录）。
 pub fn shim_binary_path() -> PathBuf {
-    let exe = std::env::current_exe().unwrap_or_default();
-    if cfg!(target_os = "macos") {
-        if cfg!(debug_assertions) {
-            // 仓库根/target/debug/liblocalproxy_shim_macos.dylib
-            let root = exe
-                .ancestors()
-                .nth(3)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            root.join("target/debug/liblocalproxy_shim_macos.dylib")
-        } else {
-            // App.app/Contents/MacOS/app → ../Resources
-            exe.parent()
-                .map(|p| p.join("../Resources/liblocalproxy_shim_macos.dylib"))
-                .unwrap_or_default()
-        }
-    } else if cfg!(target_os = "windows") {
-        if cfg!(debug_assertions) {
-            let root = exe
-                .ancestors()
-                .nth(3)
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("."));
-            root.join("target/debug/localproxy_shim_win.dll")
-        } else {
-            // 与 App 可执行同目录（打包 sidecar 放置处）
-            exe.with_file_name("localproxy_shim_win.dll")
-        }
+    let name = if cfg!(target_os = "macos") {
+        "liblocalproxy_shim_macos.dylib"
+    } else if cfg!(windows) {
+        "localproxy_shim_win.dll"
     } else {
-        PathBuf::from("localproxy-shim")
+        "localproxy-shim"
+    };
+    packaged_or_development(name)
+}
+
+fn packaged_or_development(name: &str) -> PathBuf {
+    let executable = std::env::current_exe().unwrap_or_default();
+    let packaged = if cfg!(target_os = "macos") {
+        executable
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("../Resources")
+            .join(name)
+    } else {
+        executable.with_file_name(name)
+    };
+    if packaged.is_file() || !cfg!(debug_assertions) {
+        return packaged;
     }
+    executable.with_file_name(name)
 }
 
 /// 启动本地核心子进程。
@@ -238,6 +251,10 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
             return Err("代理核心未能就绪，请检查监听配置、活动节点和内核版本".to_string());
         }
     };
+    let Some(policy_path) = info.policy_path.clone() else {
+        let _ = stop_child(&mut child);
+        return Err("核心未提供运行期策略，请更新核心程序".to_string());
+    };
     let mut startup_config = config.clone();
     startup_config.set_listener_info(info);
     let pid = child.id();
@@ -245,6 +262,7 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
         child,
         started_at: std::time::Instant::now(),
         startup_config,
+        policy_path,
     });
     tracing::info!("核心已启动 pid={pid}");
     Ok(pid)
@@ -254,6 +272,7 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
 pub fn kill_core(state: &AppState) -> Result<(), String> {
     let mut guard = state.core.lock().map_err(|e| e.to_string())?;
     if let Some(mut core) = guard.take() {
+        let _ = std::fs::remove_file(&core.policy_path);
         stop_child(&mut core.child).map_err(|e| format!("停止核心失败: {e}"))?;
         tracing::info!("核心已停止");
     }
@@ -280,6 +299,7 @@ pub fn running_core(core: &mut Option<CoreProcess>) -> Option<&CoreProcess> {
     if matches!(core.child.try_wait(), Ok(None)) {
         Some(core)
     } else {
+        let _ = std::fs::remove_file(&core.policy_path);
         None
     }
 }

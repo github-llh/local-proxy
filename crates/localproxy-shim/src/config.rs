@@ -1,9 +1,12 @@
 //! shim 运行配置（来自 launcher 注入的环境变量）。
 //!
-//! shim 零磁盘配置：所有参数经 `LP_*` 环境变量传入，
-//! 缺省值保证在未注入任何变量时行为可预期（连 127.0.0.1:1080）。
+//! 启动地址经环境变量传入。桌面会话从核心发布的快照读取安全策略。
 
-use localproxy_net::fakeip::FakeIp;
+use localproxy_net::{
+    fakeip::FakeIp,
+    policy::{NetworkPolicy, POLICY_LEASE_FILENAME, POLICY_PATH_ENV},
+    udp::UdpAction,
+};
 
 /// 环境变量前缀。
 pub const ENV_PREFIX: &str = "LP_";
@@ -128,6 +131,8 @@ pub struct ShimConfig {
     pub udp_mode: UdpMode,
     /// IPv6 策略（默认 proxy）
     pub ipv6_mode: Ipv6Mode,
+    pub policy_path: Option<std::path::PathBuf>,
+    pub dns_direct: bool,
 }
 
 impl Default for ShimConfig {
@@ -140,6 +145,8 @@ impl Default for ShimConfig {
             log: "off".to_string(),
             udp_mode: UdpMode::Block,
             ipv6_mode: Ipv6Mode::Proxy,
+            policy_path: None,
+            dns_direct: false,
         }
     }
 }
@@ -179,12 +186,49 @@ impl ShimConfig {
         if let Ok(ipv6) = std::env::var(env_keys::IPV6_MODE) {
             cfg.ipv6_mode = Ipv6Mode::from_env_value(&ipv6);
         }
+        cfg.policy_path = std::env::var_os(POLICY_PATH_ENV).map(std::path::PathBuf::from);
+        cfg.dns_direct =
+            std::env::var("LP_DNS_MODE").is_ok_and(|mode| mode.eq_ignore_ascii_case("direct"));
         cfg
+    }
+
+    pub fn network_policy(&self) -> NetworkPolicy {
+        if let Some(path) = &self.policy_path {
+            let policy = std::fs::read_to_string(path)
+                .ok()
+                .and_then(|text| NetworkPolicy::decode(&text))
+                .unwrap_or(NetworkPolicy::FAIL_CLOSED);
+            // 核心异常退出后可能留下策略文件，只有当前核心仍持锁时才使用它。
+            if policy == NetworkPolicy::FAIL_CLOSED || self.core_is_alive() {
+                return policy;
+            }
+            return NetworkPolicy::FAIL_CLOSED;
+        }
+        NetworkPolicy {
+            udp: UdpAction::from_str_opt(self.udp_mode.name()).unwrap_or(UdpAction::Block),
+            ipv6: UdpAction::from_str_opt(self.ipv6_mode.name()).unwrap_or(UdpAction::Block),
+            dns_direct: self.dns_direct,
+        }
+    }
+
+    pub fn core_is_alive(&self) -> bool {
+        // 独立使用注入层时仍支持单独配置核心地址和策略。
+        self.policy_path.as_ref().is_none_or(|path| {
+            std::fs::File::open(path.with_file_name(POLICY_LEASE_FILENAME)).is_ok_and(|file| {
+                matches!(
+                    file.try_lock_shared(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                )
+            })
+        })
     }
 
     /// 核心 SOCKS5 端点字符串（`host:port`）。
     pub fn core_endpoint(&self) -> String {
-        format!("{}:{}", self.core_host, self.core_port)
+        self.core_host.parse::<std::net::IpAddr>().map_or_else(
+            |_| format!("{}:{}", self.core_host, self.core_port),
+            |host| std::net::SocketAddr::new(host, self.core_port).to_string(),
+        )
     }
 
     /// 是否启用日志。

@@ -150,19 +150,11 @@ pub fn has_hardened_runtime(binary: &Path) -> Result<bool, LaunchError> {
     Ok(text.contains("runtime"))
 }
 
-/// 以代理模式启动应用（注入 shim dylib）。
-///
-/// - `shim_path`：shim dylib 绝对路径（`DYLD_INSERT_LIBRARIES`）
-/// - `core_host` / `core_port` / `fakeip_cidr`：shim 环境变量
-/// - `udp_mode` / `ipv6_mode`：安全策略（由 core 配置解析后注入，缺省 block/proxy）
+/// 以代理模式启动应用。
 pub fn launch(
     entry: &AppEntry,
     shim_path: &Path,
-    core_host: &str,
-    core_port: u16,
-    fakeip_cidr: &str,
-    udp_mode: &str,
-    ipv6_mode: &str,
+    config: &crate::LaunchConfig<'_>,
 ) -> Result<Session, LaunchError> {
     let resolved = resolve_binary(&entry.path_buf())?;
 
@@ -186,12 +178,7 @@ pub fn launch(
     let mut command = Command::new(&resolved.executable);
     // 注入环境（绝对路径；DYLD_INSERT_LIBRARIES 对相对路径不可靠）
     command.env("DYLD_INSERT_LIBRARIES", shim_path);
-    command.env("LP_CORE_HOST", core_host);
-    command.env("LP_CORE_PORT", core_port.to_string());
-    command.env("LP_FAKEIP_CIDR", fakeip_cidr);
-    command.env("LP_MODE", "proxy");
-    command.env("LP_UDP_MODE", udp_mode);
-    command.env("LP_IPV6_MODE", ipv6_mode);
+    command.envs(config.environment());
     // 清理系统代理环境变量：shim 全权接管，避免与 Clash 等代理软件双跳
     crate::proxy_env::remove_from(&mut command);
     // bundle 内应用的工作目录设为 bundle 根（资源加载兼容）
@@ -221,6 +208,10 @@ pub fn launch(
 }
 
 impl Session {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// 进程是否仍在运行。
     pub fn is_running(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
@@ -233,7 +224,18 @@ impl Session {
 
     /// 终止进程。
     pub fn kill(&mut self) -> std::io::Result<()> {
-        self.child.kill()
+        if self.child.try_wait()?.is_some() {
+            return Ok(());
+        }
+        // 组长仍由 Child 持有且未被回收，组号不会被其他应用复用。
+        let result = unsafe { libc::killpg(self.child.id() as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -297,5 +299,28 @@ mod tests {
         let err = resolve_binary(&dir.join("Fake.app")).unwrap_err();
         assert!(matches!(err, LaunchError::InvalidBundle(_)));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_only_signals_unreaped_session_group() {
+        let mut finished = Command::new("/usr/bin/true")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        finished.wait().unwrap();
+        let mut same_scope = Session {
+            child: finished,
+            entry_id: "finished".to_string(),
+        };
+        let mut other = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let result = same_scope.kill();
+        let other_alive = matches!(other.try_wait(), Ok(None));
+        other.kill().unwrap();
+        other.wait().unwrap();
+        assert!(result.is_ok());
+        assert!(other_alive);
     }
 }

@@ -10,18 +10,18 @@ push tag vX.Y.Z
   -> GitHub Actions: Release workflow
   -> matrix: macOS universal (arm64 + x86_64) / Windows x64
   -> cargo test --workspace（三平台）
-  -> tauri build（app/dmg + msi/nsis）
-  -> SHA256SUMS.txt + GitHub Release 资产
+  -> scripts/build-bundle.mjs（核心、shim 与 app/dmg 或 msi/nsis）
+  -> 按平台生成 SHA256SUMS + GitHub Release 资产
 ```
 
 ## 1. 固定坐标
 
-| 项目 | 值 |
-|:--|:--|
-| 仓库 | `https://github.com/github-llh/local-proxy` |
-| 主工作流 | `.github/workflows/release.yml` |
-| 当前版本 | `0.1.0` |
-| 下一个版本 | `0.1.1`（或按语义化提升） |
+| 项目    | 值                                           |
+|:------|:--------------------------------------------|
+| 仓库    | `https://github.com/github-llh/local-proxy` |
+| 主工作流  | `.github/workflows/release.yml`             |
+| 当前版本  | `0.1.0`                                     |
+| 下一个版本 | `0.1.1`（或按语义化提升）                            |
 
 ## 2. 标准发布流程
 
@@ -55,18 +55,28 @@ gh run list --workflow release.yml --limit 3
 
 必须确认 jobs：`test`（ubuntu/macos/windows）、`build-macos`、`build-windows`、`release` 全部 success。
 
+在对应平台本地构建安装包，先安装锁定的前端依赖，再运行打包脚本。
+
+```bash
+pnpm --dir ui install --frozen-lockfile
+# macOS（需要安装 arm64 和 x86_64 Rust target）
+node scripts/build-bundle.mjs universal-apple-darwin
+# Windows（需要安装 MSVC x64 Rust target）
+node scripts/build-bundle.mjs x86_64-pc-windows-msvc
+```
+
 ## 3. macOS 签名与公证（可选）
 
-未配置以下 secrets 时，CI 产出**未签名**包，用户需自行处理 Gatekeeper（`xattr -cr`）：
+未配置签名 secrets 时，构建脚本对 macOS 应用包、核心和 shim 使用 ad hoc 签名。
 
-| Secret | 用途 |
-|:--|:--|
-| `APPLE_CERTIFICATE` | Developer ID Application 证书（.p12 base64） |
-| `APPLE_CERTIFICATE_PASSWORD` | 证书密码 |
-| `APPLE_SIGNING_IDENTITY` | 签名身份 |
-| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | notarytool 公证 |
+| Secret                                          | 用途                                       |
+|:------------------------------------------------|:-----------------------------------------|
+| `APPLE_CERTIFICATE`                             | Developer ID Application 证书（.p12 base64） |
+| `APPLE_CERTIFICATE_PASSWORD`                    | 证书密码                                     |
+| `APPLE_SIGNING_IDENTITY`                        | 签名身份                                     |
+| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | notarytool 公证                            |
 
-配置后 `tauri.conf.json` 的 `bundle.macOS.signing` 与 workflow 的公证步骤自动生效。
+Tauri 从构建环境读取签名和公证变量。当前发布工作流传入证书和签名身份，需要公证时还需将对应凭据传入构建环境。
 
 ## 4. 绝对不要
 
@@ -77,18 +87,19 @@ gh run list --workflow release.yml --limit 3
 
 ## 5. 常见故障
 
-| 现象 | 处理 |
-|:--|:--|
-| `test` job 失败 | 本地复跑 `cargo test --workspace` 修复后再打 tag |
-| macOS 构建失败 `codesign` | 检查证书 secrets；无证书时确认 workflow 走未签名分支 |
-| Windows 构建失败 WebView2 | 确认 `windows-latest` runner 自带 WebView2 |
+| 现象                    | 处理                                                                        |
+|:----------------------|:--------------------------------------------------------------------------|
+| `test` job 失败         | 本地复跑 `cargo test --workspace` 修复后再打 tag                                   |
+| macOS 构建失败 `codesign` | 检查证书 secrets。无证书时确认构建使用 ad hoc 签名                                         |
+| Windows 构建失败 WebView2 | 确认 `windows-latest` runner 自带 WebView2                                    |
 | tauri build 报 icon 缺失 | `cd src-tauri && ../ui/node_modules/.bin/tauri icon ../app-icon.png` 重新生成 |
 
 ## 6. 关键文件
 
-| 文件 | 作用 |
-|:--|:--|
+| 文件                              | 作用                         |
+|:--------------------------------|:---------------------------|
 | `.github/workflows/release.yml` | tag 发布、三平台测试、双平台构建、Release |
-| `.github/workflows/ci.yml` | PR/push 的测试与 lint |
-| `src-tauri/tauri.conf.json` | 应用配置（bundle targets/icon） |
-| `ui/package.json` | 前端依赖 |
+| `.github/workflows/ci.yml`      | PR/push 的测试与 lint          |
+| `scripts/build-bundle.mjs`      | 构建并打包核心与当前平台的 shim         |
+| `src-tauri/tauri.conf.json`     | 应用配置（bundle targets/icon）  |
+| `ui/package.json`               | 前端依赖                       |

@@ -114,8 +114,9 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     config.http_port = http_listener.local_addr()?.port();
     config.control_port = control_listener.local_addr()?.port();
     config.validate()?;
-    let listeners = config.listener_info();
+    let mut listeners = config.listener_info();
     let ctx = Arc::new(ServerContext::start(config).await?);
+    listeners.policy_path = ctx.policy_path();
 
     if cli.desktop {
         use std::io::Write;

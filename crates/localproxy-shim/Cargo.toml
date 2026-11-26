@@ -8,6 +8,3 @@ description = "LocalProxy 注入 shim 公共逻辑：FakeIP 映射、SOCKS5 就�
 [dependencies]
 localproxy-net = { workspace = true }
 tracing.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Networking_WinSock"] }

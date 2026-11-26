@@ -141,7 +141,9 @@ async fn reload(ctx: &ServerContext, path: Option<&Path>) -> Result<String, Stri
     config.validate()?;
     let id = config.upstream.active.clone();
     let settings = RuntimeSettings::prepare(config, Some(&previous)).await?;
-    *ctx.settings.write().await = Arc::new(settings);
+    let mut current = ctx.settings.write().await;
+    ctx.publish_policy(&settings.config)?;
+    *current = Arc::new(settings);
     Ok(id)
 }
 

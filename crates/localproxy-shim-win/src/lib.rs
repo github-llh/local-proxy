@@ -21,12 +21,12 @@
 
 use std::ffi::c_void;
 use std::net::{Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use localproxy_shim::config::ShimConfig;
 use localproxy_shim::engine;
 use windows_sys::s;
-use windows_sys::Win32::Foundation::{BOOL, TRUE};
+use windows_sys::Win32::Foundation::{BOOL, ERROR_DLL_INIT_FAILED, FALSE, TRUE};
 use windows_sys::Win32::Networking::WinSock::{
     closesocket, socket, AF_INET, IPPROTO_TCP, SOCK_STREAM,
 };
@@ -35,8 +35,9 @@ use windows_sys::Win32::Networking::WinSock::{
     send as sys_send, sendto as sys_sendto, GetAddrInfoW as sys_GetAddrInfoW, WSAGetLastError,
     WSASendTo as sys_WSASendTo, WSASetLastError, WSAStartup, ADDRINFOA, ADDRINFOW, AF_INET6,
     AI_NUMERICHOST, LPWSAOVERLAPPED_COMPLETION_ROUTINE, SOCKADDR, SOCKET, SOCK_DGRAM, SOL_SOCKET,
-    SO_TYPE, WSABUF, WSAENETUNREACH, WSAHOST_NOT_FOUND,
+    SO_TYPE, WSABUF, WSAECONNREFUSED, WSAENETUNREACH, WSAHOST_NOT_FOUND,
 };
+use windows_sys::Win32::Networking::WinSock::{getpeername, WSASend as sys_WSASend};
 use windows_sys::Win32::System::LibraryLoader::GetProcAddress;
 use windows_sys::Win32::System::Threading::{
     CreateProcessA as sys_CreateProcessA, CreateProcessW as sys_CreateProcessW,
@@ -65,11 +66,24 @@ type WSASendToFn = unsafe extern "system" fn(
     LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) -> i32;
 
+type SendFn = unsafe extern "system" fn(SOCKET, *const u8, i32, i32) -> i32;
+type WSASendFn = unsafe extern "system" fn(
+    SOCKET,
+    *const WSABUF,
+    u32,
+    *mut u32,
+    u32,
+    *mut OVERLAPPED,
+    LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32;
+
 static mut ORIG_CONNECT: Option<ConnectFn> = None;
 static mut ORIG_GETADDRINFO: Option<GetAddrInfoAFn> = None;
 static mut ORIG_GETADDRINFOW: Option<GetAddrInfoWFn> = None;
 static mut ORIG_SENDTO: Option<SendToFn> = None;
 static mut ORIG_WSA_SENDTO: Option<WSASendToFn> = None;
+static mut ORIG_SEND: Option<SendFn> = None;
+static mut ORIG_WSA_SEND: Option<WSASendFn> = None;
 
 // ============= 平台 SockIo 实现 =============
 
@@ -129,6 +143,7 @@ static IO: WinSockIo = WinSockIo;
 // ============= 安装状态 =============
 
 static INSTALLED: AtomicBool = AtomicBool::new(false);
+static SHIM_MODULE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 // ============= hook 函数 =============
 
@@ -180,8 +195,8 @@ unsafe extern "system" fn hook_connect(fd: SOCKET, addr: *const SOCKADDR, len: i
     match engine::proxy_connect(&IO, fd as i64, &target) {
         Ok(true) => 0,
         Ok(false) => call_orig_connect(fd, addr, len),
-        Err(_) => {
-            unsafe { windows_sys::Win32::Networking::WinSock::WSASetLastError(10061) }; // WSAECONNREFUSED
+        Err(error) => {
+            unsafe { WSASetLastError(error.raw_os_error().unwrap_or(WSAECONNREFUSED)) };
             -1
         }
     }
@@ -218,6 +233,44 @@ fn refuse_unproxied_udp(target: &SocketAddr) -> bool {
     true
 }
 
+fn refuse_connected_datagram(fd: SOCKET) -> bool {
+    if !engine::is_installed() || !is_datagram(fd) {
+        return false;
+    }
+    let mut addr: windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE =
+        unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of_val(&addr) as i32;
+    let addr = (&mut addr as *mut windows_sys::Win32::Networking::WinSock::SOCKADDR_STORAGE).cast();
+    (unsafe { getpeername(fd, addr, &mut len) }) == 0
+        && unsafe { parse_sockaddr(addr, len) }
+            .as_ref()
+            .is_some_and(refuse_unproxied_udp)
+}
+
+unsafe extern "system" fn hook_send(fd: SOCKET, buf: *const u8, len: i32, flags: i32) -> i32 {
+    if refuse_connected_datagram(fd) {
+        return -1;
+    }
+    let send = unsafe { ORIG_SEND }.unwrap_or(sys_send);
+    unsafe { send(fd, buf, len, flags) }
+}
+
+unsafe extern "system" fn hook_wsa_send(
+    fd: SOCKET,
+    bufs: *const WSABUF,
+    count: u32,
+    sent: *mut u32,
+    flags: u32,
+    overlapped: *mut OVERLAPPED,
+    completion: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+) -> i32 {
+    if refuse_connected_datagram(fd) {
+        return -1;
+    }
+    let send = unsafe { ORIG_WSA_SEND }.unwrap_or(sys_WSASend);
+    unsafe { send(fd, bufs, count, sent, flags, overlapped, completion) }
+}
+
 /// Windows shim 尚未中继报文，需代理的公网 UDP 返回错误。
 unsafe extern "system" fn hook_sendto(
     fd: SOCKET,
@@ -227,10 +280,15 @@ unsafe extern "system" fn hook_sendto(
     target: *const SOCKADDR,
     target_len: i32,
 ) -> i32 {
-    if let Some(target) = unsafe { parse_sockaddr(target, target_len) } {
-        if refuse_unproxied_udp(&target) {
-            return -1;
-        }
+    let denied = if target.is_null() {
+        refuse_connected_datagram(fd)
+    } else {
+        unsafe { parse_sockaddr(target, target_len) }
+            .as_ref()
+            .is_some_and(refuse_unproxied_udp)
+    };
+    if denied {
+        return -1;
     }
     match unsafe { ORIG_SENDTO } {
         Some(original) => unsafe { original(fd, buf, len, flags, target, target_len) },
@@ -249,10 +307,14 @@ unsafe extern "system" fn hook_wsa_sendto(
     overlapped: *mut OVERLAPPED,
     completion: LPWSAOVERLAPPED_COMPLETION_ROUTINE,
 ) -> i32 {
-    if unsafe { parse_sockaddr(target, target_len) }
-        .as_ref()
-        .is_some_and(refuse_unproxied_udp)
-    {
+    let denied = if target.is_null() {
+        refuse_connected_datagram(fd)
+    } else {
+        unsafe { parse_sockaddr(target, target_len) }
+            .as_ref()
+            .is_some_and(refuse_unproxied_udp)
+    };
+    if denied {
         return -1;
     }
     let sendto = unsafe { ORIG_WSA_SENDTO }.unwrap_or(sys_WSASendTo);
@@ -434,8 +496,8 @@ impl ChildPolicy {
         }
         match self.mode.as_str() {
             "same-dir" => {
-                // 与 shim DLL 同目录（同 bundle 的 Electron 多进程场景）
-                match self_shim_dir() {
+                // 与当前应用同目录（同一安装目录的子进程）。
+                match host_application_dir() {
                     Some(dir) => {
                         // 命令行中任一路径片段位于同目录
                         cmd_line_lower.contains(&dir.to_ascii_lowercase())
@@ -452,96 +514,118 @@ impl ChildPolicy {
     }
 }
 
-/// shim 自身 DLL 所在目录（小写宽字符串）。
-fn self_shim_dir() -> Option<String> {
-    let mut buf = vec![0u16; 260];
-    let len = unsafe {
-        windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
-            std::ptr::null_mut(),
-            buf.as_mut_ptr(),
-            buf.len() as u32,
-        )
-    };
-    if len == 0 {
-        return None;
-    }
-    let path = String::from_utf16_lossy(&buf[..len as usize]);
-    std::path::Path::new(&path)
-        .parent()
-        .map(|p| p.to_string_lossy().to_string())
+/// 当前应用可执行文件所在目录。
+fn host_application_dir() -> Option<String> {
+    Some(
+        std::env::current_exe()
+            .ok()?
+            .parent()?
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
-/// 向新创建的子进程注入 shim（失败仅记录，不影响父进程行为）。
-fn inject_child(pi: &PROCESS_INFORMATION) {
-    let policy = ChildPolicy::from_env();
-    if !policy.count_ok() {
-        tracing::debug!("shim-win: 子进程注入达上限 {}，跳过", policy.max);
-        return;
-    }
-    if pi.dwProcessId == unsafe { GetCurrentProcessId() } {
-        return; // 不会发生，防御
+/// 只有注入和代理初始化全部成功，才允许受管子进程恢复执行。
+fn inject_child(pi: &PROCESS_INFORMATION, policy: &ChildPolicy) -> bool {
+    if !policy.count_ok() || pi.dwProcessId == unsafe { GetCurrentProcessId() } {
+        return false;
     }
     let Some(dll_path) = self_shim_path() else {
-        return;
+        return false;
     };
     let process = windows::Win32::Foundation::HANDLE(pi.hProcess);
-    if let Err(e) = localproxy_inject::inject_dll(process, &dll_path) {
-        tracing::debug!("shim-win: 子进程注入失败 pid={}: {e}", pi.dwProcessId);
-        return;
-    }
-    if let Err(e) =
+    let initialized = localproxy_inject::inject_dll(process, &dll_path).and_then(|()| {
         localproxy_inject::call_remote_export(process, &dll_path, "localproxy_shim_init")
-    {
-        tracing::debug!("shim-win: 子进程 init 失败 pid={}: {e}", pi.dwProcessId);
-        return;
+    });
+    if !matches!(initialized, Ok(1)) {
+        tracing::warn!(
+            "shim-win: 子进程代理初始化失败 pid={}: {initialized:?}",
+            pi.dwProcessId
+        );
+        return false;
     }
     CHILD_INJECT_COUNT.fetch_add(1, Ordering::Relaxed);
-    tracing::info!(
-        "shim-win: 子进程注入成功 pid={}（累计 {}）",
-        pi.dwProcessId,
-        CHILD_INJECT_COUNT.load(Ordering::Relaxed)
-    );
+    true
 }
 
-/// shim 自身 DLL 完整路径。
+fn finish_child(
+    ok: BOOL,
+    process_info: *mut PROCESS_INFORMATION,
+    policy: &ChildPolicy,
+    caller_suspended: bool,
+) -> BOOL {
+    if ok == FALSE || process_info.is_null() {
+        return ok;
+    }
+    let pi = unsafe { &mut *process_info };
+    if !inject_child(pi, policy)
+        || (!caller_suspended
+            && unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) }
+                == u32::MAX)
+    {
+        // 句柄来自本次 CreateProcess，只取消本次尚未启动的子进程。
+        unsafe {
+            windows_sys::Win32::System::Threading::TerminateProcess(pi.hProcess, 1);
+            windows_sys::Win32::Foundation::CloseHandle(pi.hThread);
+            windows_sys::Win32::Foundation::CloseHandle(pi.hProcess);
+            *pi = std::mem::zeroed();
+            windows_sys::Win32::Foundation::SetLastError(ERROR_DLL_INIT_FAILED);
+        }
+        return FALSE;
+    }
+    ok
+}
+
+/// 用 DllMain 保存的本模块句柄获取路径。
 fn self_shim_path() -> Option<std::path::PathBuf> {
-    let mut buf = vec![0u16; 260];
+    use std::{ffi::OsString, os::windows::ffi::OsStringExt};
+
+    let module = SHIM_MODULE.load(Ordering::Acquire);
+    if module.is_null() {
+        return None;
+    }
+    let mut buf = vec![0u16; 32768];
     let len = unsafe {
         windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW(
-            std::ptr::null_mut(),
+            module,
             buf.as_mut_ptr(),
             buf.len() as u32,
         )
-    };
-    if len == 0 {
+    } as usize;
+    if len == 0 || len >= buf.len() {
         return None;
     }
-    Some(std::path::PathBuf::from(String::from_utf16_lossy(
-        &buf[..len as usize],
-    )))
+    Some(std::path::PathBuf::from(OsString::from_wide(&buf[..len])))
 }
 
-/// DLL 加载完成后的初始化入口（注入方二次远程调用）。
-///
-/// 返回 true 表示安装成功。
+/// Windows 线程入口以 32 位状态码报告代理初始化结果。
 #[no_mangle]
-pub unsafe extern "system" fn localproxy_shim_init() -> bool {
-    // WSAStartup（目标进程可能尚未初始化 winsock；MinHook 安装也需要）
-    let mut wsa_data =
-        unsafe { std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::WSADATA>() };
-    unsafe { WSAStartup(0x0202, &mut wsa_data) };
-
-    let cfg = ShimConfig::from_env();
-    if !engine::install(&cfg) {
-        // 已安装过也视为成功
-        return engine::is_installed();
-    }
-    INSTALLED.store(true, Ordering::SeqCst);
-
-    // MinHook 安装（ws2_32 内联 hook）
-    let ok = unsafe { install_hooks() };
-    tracing::info!("shim-win: hook 安装 {}", if ok { "成功" } else { "失败" });
-    ok
+pub unsafe extern "system" fn localproxy_shim_init(_unused: *mut c_void) -> u32 {
+    static INITIALIZED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    u32::from(*INITIALIZED.get_or_init(|| {
+        let mut wsa_data =
+            unsafe { std::mem::zeroed::<windows_sys::Win32::Networking::WinSock::WSADATA>() };
+        if unsafe { WSAStartup(0x0202, &mut wsa_data) } != 0 {
+            return false;
+        }
+        let cfg = ShimConfig::from_env();
+        // 自定义子进程环境丢失注入配置时，禁止回退到其他服务可能占用的默认端口。
+        if !cfg
+            .policy_path
+            .as_ref()
+            .is_some_and(|path| path.is_absolute() && path.is_file())
+            || !cfg.core_is_alive()
+            || !cfg
+                .core_endpoint()
+                .parse::<SocketAddr>()
+                .is_ok_and(|addr| addr.ip().is_loopback())
+            || !engine::install(&cfg)
+        {
+            return false;
+        }
+        INSTALLED.store(true, Ordering::SeqCst);
+        unsafe { install_hooks() }
+    }))
 }
 
 /// MinHook 安装全部 hook。
@@ -561,12 +645,14 @@ unsafe fn install_hooks() -> bool {
     };
     let connect_addr = symbol(ws2, s!("connect"));
     let sendto_addr = symbol(ws2, s!("sendto"));
+    let send_addr = symbol(ws2, s!("send"));
+    let wsa_send_addr = symbol(ws2, s!("WSASend"));
     let wsa_sendto_addr = symbol(ws2, s!("WSASendTo"));
     let getaddrinfo_addr = symbol(ws2, s!("getaddrinfo"));
     let getaddrinfow_addr = symbol(ws2, s!("GetAddrInfoW"));
 
     macro_rules! hook {
-        ($addr:expr, $hook:expr, $orig:ident) => {{
+        ($addr:expr, $hook:expr, $orig:ident, $function:ty) => {{
             let addr = $addr;
             if addr.is_null() {
                 return false;
@@ -578,26 +664,31 @@ unsafe fn install_hooks() -> bool {
                     return false;
                 }
             };
-            unsafe { $orig = Some(std::mem::transmute(orig)) };
+            unsafe { $orig = Some(std::mem::transmute::<*mut c_void, $function>(orig)) };
         }};
     }
 
-    hook!(connect_addr, hook_connect as *mut c_void, ORIG_CONNECT);
-    hook!(sendto_addr, hook_sendto as *mut c_void, ORIG_SENDTO);
+    hook!(connect_addr, hook_connect, ORIG_CONNECT, ConnectFn);
+    hook!(sendto_addr, hook_sendto, ORIG_SENDTO, SendToFn);
+    hook!(send_addr, hook_send, ORIG_SEND, SendFn);
+    hook!(wsa_send_addr, hook_wsa_send, ORIG_WSA_SEND, WSASendFn);
     hook!(
         wsa_sendto_addr,
-        hook_wsa_sendto as *mut c_void,
-        ORIG_WSA_SENDTO
+        hook_wsa_sendto,
+        ORIG_WSA_SENDTO,
+        WSASendToFn
     );
     hook!(
         getaddrinfo_addr,
-        hook_getaddrinfo as *mut c_void,
-        ORIG_GETADDRINFO
+        hook_getaddrinfo,
+        ORIG_GETADDRINFO,
+        GetAddrInfoAFn
     );
     hook!(
         getaddrinfow_addr,
-        hook_getaddrinfo_w as *mut c_void,
-        ORIG_GETADDRINFOW
+        hook_getaddrinfo_w,
+        ORIG_GETADDRINFOW,
+        GetAddrInfoWFn
     );
 
     // kernel32: CreateProcessW/A（子进程注入）
@@ -611,13 +702,15 @@ unsafe fn install_hooks() -> bool {
     let cpa_addr = symbol(kernel32, s!("CreateProcessA"));
     hook!(
         cpw_addr,
-        hook_CreateProcessW as *mut c_void,
-        ORIG_CREATE_PROCESS_W
+        hook_create_process_w,
+        ORIG_CREATE_PROCESS_W,
+        CreateProcessWFn
     );
     hook!(
         cpa_addr,
-        hook_CreateProcessA as *mut c_void,
-        ORIG_CREATE_PROCESS_A
+        hook_create_process_a,
+        ORIG_CREATE_PROCESS_A,
+        CreateProcessAFn
     );
 
     match unsafe { MinHook::enable_all_hooks() } {
@@ -666,7 +759,7 @@ static mut ORIG_CREATE_PROCESS_W: Option<CreateProcessWFn> = None;
 static mut ORIG_CREATE_PROCESS_A: Option<CreateProcessAFn> = None;
 
 /// `CreateProcessW` 替换实现。
-unsafe extern "system" fn hook_CreateProcessW(
+unsafe extern "system" fn hook_create_process_w(
     app_name: *const u16,
     cmd_line: *mut u16,
     process_attrs: *const std::ffi::c_void,
@@ -694,34 +787,37 @@ unsafe extern "system" fn hook_CreateProcessW(
     };
 
     // 强制挂起（调用方未要求时），注入后恢复
+    let policy = ChildPolicy::from_env();
+    let command = format!("{} {}", unsafe { read_wide(app_name) }, unsafe {
+        read_wide(cmd_line)
+    });
+    let should_inject = policy.should_inject(&command.to_ascii_lowercase());
     let caller_suspended = flags & CREATE_SUSPENDED_FLAG != 0;
+    let flags = if should_inject {
+        flags | CREATE_SUSPENDED_FLAG
+    } else {
+        flags
+    };
     let ok = call_orig_cpw(
         app_name,
         cmd_line,
         process_attrs,
         thread_attrs,
         inherit,
-        flags | CREATE_SUSPENDED_FLAG,
+        flags,
         env,
         cwd,
         startup_info,
         process_info,
     );
-    if ok != 0 && !process_info.is_null() {
-        // SAFETY: 原函数成功时 process_info 有效
-        let pi = unsafe { &*process_info };
-        let policy = ChildPolicy::from_env();
-        let cmd_lower = unsafe { read_wide(cmd_line) }.to_ascii_lowercase();
-        if policy.should_inject(&cmd_lower) {
-            inject_child(pi);
-        }
-        if !caller_suspended {
-            unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) };
-        }
+    if should_inject {
+        finish_child(ok, process_info, &policy, caller_suspended)
+    } else {
+        ok
     }
-    ok
 }
 
+#[allow(clippy::too_many_arguments)] // 与 Win32 CreateProcessW 的参数保持一致。
 unsafe fn call_orig_cpw(
     app_name: *const u16,
     cmd_line: *mut u16,
@@ -768,7 +864,7 @@ unsafe fn call_orig_cpw(
 }
 
 /// `CreateProcessA` 替换实现（ANSI；策略与 W 版一致）。
-unsafe extern "system" fn hook_CreateProcessA(
+unsafe extern "system" fn hook_create_process_a(
     app_name: *const u8,
     cmd_line: *mut u8,
     process_attrs: *const std::ffi::c_void,
@@ -795,34 +891,37 @@ unsafe extern "system" fn hook_CreateProcessA(
         );
     };
 
+    let policy = ChildPolicy::from_env();
+    let command = format!("{} {}", unsafe { read_ansi(app_name) }, unsafe {
+        read_ansi(cmd_line)
+    });
+    let should_inject = policy.should_inject(&command.to_ascii_lowercase());
     let caller_suspended = flags & CREATE_SUSPENDED_FLAG != 0;
+    let flags = if should_inject {
+        flags | CREATE_SUSPENDED_FLAG
+    } else {
+        flags
+    };
     let ok = call_orig_cpa(
         app_name,
         cmd_line,
         process_attrs,
         thread_attrs,
         inherit,
-        flags | CREATE_SUSPENDED_FLAG,
+        flags,
         env,
         cwd,
         startup_info,
         process_info,
     );
-    if ok != 0 && !process_info.is_null() {
-        // SAFETY: 原函数成功时 process_info 有效
-        let pi = unsafe { &*process_info };
-        let policy = ChildPolicy::from_env();
-        let cmd_lower = unsafe { read_ansi(cmd_line) }.to_ascii_lowercase();
-        if policy.should_inject(&cmd_lower) {
-            inject_child(pi);
-        }
-        if !caller_suspended {
-            unsafe { windows_sys::Win32::System::Threading::ResumeThread(pi.hThread) };
-        }
+    if should_inject {
+        finish_child(ok, process_info, &policy, caller_suspended)
+    } else {
+        ok
     }
-    ok
 }
 
+#[allow(clippy::too_many_arguments)] // 与 Win32 CreateProcessA 的参数保持一致。
 unsafe fn call_orig_cpa(
     app_name: *const u8,
     cmd_line: *mut u8,
@@ -901,14 +1000,13 @@ unsafe fn read_ansi(ptr: *const u8) -> String {
 #[no_mangle]
 #[allow(non_snake_case)]
 pub unsafe extern "system" fn DllMain(
-    _hinst: *mut c_void,
+    hinst: *mut c_void,
     reason: u32,
     _reserved: *mut c_void,
 ) -> BOOL {
     const DLL_PROCESS_ATTACH: u32 = 1;
     if reason == DLL_PROCESS_ATTACH {
-        let pid = unsafe { GetCurrentProcessId() };
-        tracing::info!("shim-win: 已注入进程 pid={pid}（等待 init 调用安装 hook）");
+        SHIM_MODULE.store(hinst, Ordering::Release);
     }
     TRUE
 }
