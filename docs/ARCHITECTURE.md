@@ -30,8 +30,19 @@
 │   shim（Rust cdylib）：                                        │
 │     macOS：__interpose 段 hook connect/getaddrinfo            │
 │     Windows：vendored MinHook hook ws2_32                     │
+│   原生代理（macOS hardened runtime 的 Chromium 系）：          │
+│     Chromium 自带 --proxy-server → 核心 HTTP 端口            │
+│     独立 --user-data-dir + --disable-quic，不注入             │
 └──────────────────────────────────────────────────────────────┘
 ```
+
+**两条启动路径的分工**（0.4.3 起）：
+
+| 目标应用                          | 方式                               | 覆盖范围                       |
+|:------------------------------|:---------------------------------|:---------------------------|
+| 可注入应用（大多数原生/Electron）         | `DYLD_INSERT_LIBRARIES` / DLL 注入 | DNS、TCP、UDP 语义齐全           |
+| hardened runtime + Chromium 系 | 原生 `--proxy-server`（独立 profile）  | 仅 HTTP(S)/CONNECT；已禁用 QUIC |
+| hardened runtime + 其他         | 拒绝并给出可操作说明                       | —                          |
 
 ## 数据流（TCP）
 

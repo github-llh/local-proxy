@@ -58,6 +58,8 @@ export interface SessionInfo {
   entry_id: string;
   entry_name: string;
   pid: number;
+  /** injected = 注入 shim；native-proxy = 应用自带 --proxy-server（独立配置目录） */
+  mode?: "injected" | "native-proxy" | "unsupported";
   uptime_secs: number;
 }
 

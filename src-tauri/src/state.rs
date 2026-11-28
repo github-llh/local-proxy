@@ -59,6 +59,18 @@ impl AppSession {
         }
     }
 
+    /// 本次会话的启动方式（注入 / 原生代理），供前端如实展示。
+    pub fn mode(&self) -> &'static str {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        {
+            self.process.mode.as_str()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            "unsupported"
+        }
+    }
+
     pub fn is_running(&mut self) -> bool {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {

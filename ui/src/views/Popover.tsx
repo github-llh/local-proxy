@@ -379,6 +379,13 @@ export default function Popover() {
             {sessions.map((s) => (
               <li key={s.entry_id} className="list-item">
                 <span className="item-name">{s.entry_name}</span>
+                {s.mode === "native-proxy" ? (
+                  <span className="badge" title={t("popover.nativeProxyHint")}>
+                    {t("popover.nativeProxy")}
+                  </span>
+                ) : s.mode === "injected" ? (
+                  <span className="badge">{t("popover.injected")}</span>
+                ) : null}
                 <span className="muted">pid {s.pid}</span>
                 <button className="btn btn-small" onClick={() => handleStop(s.entry_id)}>
                   {t("popover.stop")}

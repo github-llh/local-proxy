@@ -51,14 +51,14 @@
 ### 在 LocalProxy 中切换 Clash 节点
 
 1. 确认 Clash 的控制面监听方式：
-   - mihomo / ClashX / Clash for Windows：TCP 回环端口，如 `127.0.0.1:9090`，Secret 可能为空；
-   - **Clash Verge Rev：默认使用 Unix domain socket**（`verge-mihomo -ext-ctl-unix
+    - mihomo / ClashX / Clash for Windows：TCP 回环端口，如 `127.0.0.1:9090`，Secret 可能为空；
+    - **Clash Verge Rev：默认使用 Unix domain socket**（`verge-mihomo -ext-ctl-unix
      /var/folders/.../verge-mihomo.sock`），配置模板里的 `9097` 通常**并未监听 TCP**，
-     且 Secret 是随机值。
+      且 Secret 是随机值。
 2. 在 LocalProxy「设置 → 上游代理」填写该 Clash 实例的代理地址与端口（通常是 `mixed-port`，如 `7897`），
    启用「Clash / mihomo 节点选择」。控制地址可以填：
-   - `127.0.0.1:9097`（TCP，仅回环）；
-   - `unix:/path/to/verge-mihomo.sock`（Unix socket）。
+    - `127.0.0.1:9097`（TCP，仅回环）；
+    - `unix:/path/to/verge-mihomo.sock`（Unix socket）。
 3. 不确定时点「自动检测」：它会读 Clash 的运行配置拿 Secret，扫描进程参数与临时目录里的
    `mihomo`/`clash` socket，并用 `/version` 校验，成功后自动填入。
 4. 打开菜单栏面板的「Clash 节点」，选择策略组和节点。「刷新」会读取 Clash 当前的选择及订阅更新后的列表。
@@ -102,12 +102,12 @@ FakeIP 仍可用于连接。显式直连规则或节点服务器需要在本地�
 默认 `udp_mode=auto`：按当前上游类型解析——SOCKS5 上游为 `proxy`（按规则分流），
 HTTP 上游不支持 UDP，按 `udp_fallback` 处理（默认 `block`）。
 
-| `udp_mode`  | 行为                                                   | 适用                            |
-|:------------|:-----------------------------------------------------|:------------------------------|
-| `block`     | 阻断公网 UDP，返回 `ENETUNREACH` 促使应用回退 TCP                 | 防泄漏优先（API/网页场景，QUIC 自动回落 TCP） |
-| `proxy`     | 核心按路由规则处理每个 UDP 报文，命中代理的报文通过 SOCKS5 UDP Associate 转发 | 需要 UDP 分流的场景                  |
-| `direct`    | UDP 直连放行                                             | 排障对照                          |
-| `auto`（默认） | 按上游类型解析为 `proxy`，或按 `udp_fallback` 处理                 | 多数场景                          |
+| `udp_mode` | 行为                                                   | 适用                            |
+|:-----------|:-----------------------------------------------------|:------------------------------|
+| `block`    | 阻断公网 UDP，返回 `ENETUNREACH` 促使应用回退 TCP                 | 防泄漏优先（API/网页场景，QUIC 自动回落 TCP） |
+| `proxy`    | 核心按路由规则处理每个 UDP 报文，命中代理的报文通过 SOCKS5 UDP Associate 转发 | 需要 UDP 分流的场景                  |
+| `direct`   | UDP 直连放行                                             | 排障对照                          |
+| `auto`（默认） | 按上游类型解析为 `proxy`，或按 `udp_fallback` 处理                | 多数场景                          |
 
 注入层对局域网、回环和标准 mDNS 组播保留直连。手工连接核心 SOCKS5 端口的客户端遵循核心的 UDP 策略。
 核心中继也检查「允许代理的端口」。
@@ -150,12 +150,12 @@ popover「风控自检」卡片（探测默认关闭，在设置 → 高级开�
 
 ## 已知限制（不开 TUN 的固有权衡）
 
-| 限制                      | 说明                                                                                                     |
-|:------------------------|:-------------------------------------------------------------------------------------------------------|
-| SIP 保护的系统二进制不可注入        | `/usr/bin/*`、`/bin/*` 等 Apple 平台二进制会被剥离 `DYLD_INSERT_LIBRARIES`；请使用 Homebrew/nvm 等非系统版本                |
-| hardened runtime 应用不可注入 | 启用了 `runtime` 标志的 app（部分官方 Node/Electron 构建）会被 dyld 拒绝加载库；launcher 会提前检测并提示，可改用 `--proxy-server` 类启动参数 |
-| 仅代理「从菜单栏启动」的应用          | 已运行的应用、系统服务不在管辖范围（这是不开 TUN 的前提）                                                                        |
-| Windows 注入受安全软件影响       | 部分 AV/EDR 拦截远程线程注入，会有明确错误提示                                                                            |
+| 限制                      | 说明                                                                                                                                                                    |
+|:------------------------|:----------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| SIP 保护的系统二进制不可注入        | `/usr/bin/*`、`/bin/*`、`/System/*` 等 Apple 平台二进制会被剥离 `DYLD_INSERT_LIBRARIES`，launcher 启动前直接拒绝（否则进程照常启动却完全不代理）；请使用 Homebrew/nvm 等非系统版本 |
+| hardened runtime 应用不可注入 | 启用了 `runtime` 标志的 app 会被 dyld 拒绝加载库。Chromium 系（Chrome/Edge/Brave/Vivaldi/Opera）会自动改用原生 `--proxy-server` 启动，并使用独立配置目录（**不含日常登录态**）；其他应用仍不可注入，可改用 Chromium 浏览器或系统代理/TUN |
+| 仅代理「从菜单栏启动」的应用          | 已运行的应用、系统服务不在管辖范围（这是不开 TUN 的前提）                                                                                                                                       |
+| Windows 注入受安全软件影响       | 部分 AV/EDR 拦截远程线程注入，会有明确错误提示                                                                                                                                           |
 
 ## 配置文件
 

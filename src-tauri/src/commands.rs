@@ -6,7 +6,7 @@
 //! - 前端不直接读文件，全部经本层；
 //! - 命令实现不跨 IO 持有配置/会话锁：启动应用、探测、停止进程均在锁外执行。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use localproxy_core::config::{AppConfig, UpstreamServer};
 use localproxy_launcher::app_entry::AppEntry;
@@ -77,6 +77,8 @@ pub struct SessionInfo {
     pub entry_name: String,
     pub pid: u32,
     pub uptime_secs: u64,
+    /// "injected" 或 "native-proxy"：让用户知道这次启动是否真的注入了
+    pub mode: &'static str,
 }
 
 /// 查询核心状态。
@@ -151,6 +153,7 @@ pub fn list_sessions(state: State<'_, AppState>) -> Vec<SessionInfo> {
             entry_name: s.entry_name.clone(),
             pid: s.pid(),
             uptime_secs: s.started_at.elapsed().as_secs(),
+            mode: s.mode(),
         })
         .collect()
 }
@@ -256,7 +259,7 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
     }
 
     spawn_core(&state)?;
-    let (core_addr, policy_path) = {
+    let (core_addr, http_addr, policy_path) = {
         let mut guard = lock_recover(&state.core);
         let running = running_core(&mut guard).ok_or("LocalProxy 核心已退出")?;
         let core_addr = running
@@ -264,17 +267,28 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
             .socks5_endpoint()
             .parse()
             .map_err(|e| format!("核心地址无效: {e}"))?;
-        (core_addr, running.policy_path.clone())
+        let http_addr = running
+            .startup_config
+            .http_endpoint()
+            .parse()
+            .map_err(|e| format!("核心 HTTP 地址无效: {e}"))?;
+        (core_addr, http_addr, running.policy_path.clone())
     };
+    // 原生代理模式需要独立配置目录；与 config.json 同级，随应用数据目录清理
+    let profile_root = state
+        .config_path
+        .parent()
+        .map(|dir| dir.join("profiles"))
+        .unwrap_or_else(|| PathBuf::from("profiles"));
     let launch = localproxy_launcher::LaunchConfig {
         core: core_addr,
+        http: http_addr,
         policy_path: &policy_path,
+        profile_root: &profile_root,
     };
 
+    // shim 只在注入模式需要：是否注入由 launcher 按目标应用决定，这里不做预检
     let shim = shim_binary_path();
-    if !shim.exists() {
-        return Err(format!("找不到当前平台的代理 shim: {}", shim.display()));
-    }
 
     // 平台注入启动耗时较长，且不持有任何状态锁。
     let session = launch_via_platform(&entry, &shim, &launch)?;
@@ -283,6 +297,7 @@ pub fn launch_app(state: State<'_, AppState>, id: String) -> Result<SessionInfo,
         entry_name: session.entry_name.clone(),
         pid: session.pid(),
         uptime_secs: 0,
+        mode: session.mode(),
     };
     {
         let mut sessions = lock_recover(&state.sessions);

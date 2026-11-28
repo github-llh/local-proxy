@@ -684,6 +684,11 @@ impl AppConfig {
         socket_endpoint(&self.listen_host, self.socks5_port)
     }
 
+    /// HTTP 代理端点字符串（Chromium 的 `--proxy-server` 用这个）。
+    pub fn http_endpoint(&self) -> String {
+        socket_endpoint(&self.listen_host, self.http_port)
+    }
+
     /// 控制面端点字符串。
     pub fn control_endpoint(&self) -> String {
         format!("{DEFAULT_LISTEN_HOST}:{}", self.control_port)

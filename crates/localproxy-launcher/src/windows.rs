@@ -30,6 +30,8 @@ pub struct Session {
     job: OwnedHandle,
     pid: u32,
     pub entry_id: String,
+    /// Windows 只有注入模式（没有 hardened runtime 概念）
+    pub mode: crate::LaunchMode,
 }
 
 /// launcher 错误。
@@ -165,6 +167,7 @@ pub fn launch(
         job,
         pid,
         entry_id: entry.id.clone(),
+        mode: crate::LaunchMode::Injected,
     })
 }
 

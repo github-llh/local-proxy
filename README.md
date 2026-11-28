@@ -28,13 +28,13 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 
 ## 文档导航
 
-| 我想… | 看 |
-|:--|:--|
-| 安装并日常使用 | [docs/USAGE.md](docs/USAGE.md) |
-| 从源码构建、打安装包 | [docs/BUILD.md](docs/BUILD.md) |
-| 发布新版本 | [docs/RELEASE.md](docs/RELEASE.md) |
-| 了解内部实现 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
-| 排查问题 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
+| 我想…        | 看                                                  |
+|:-----------|:---------------------------------------------------|
+| 安装并日常使用    | [docs/USAGE.md](docs/USAGE.md)                     |
+| 从源码构建、打安装包 | [docs/BUILD.md](docs/BUILD.md)                     |
+| 发布新版本      | [docs/RELEASE.md](docs/RELEASE.md)                 |
+| 了解内部实现     | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)       |
+| 排查问题       | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 
 ## 核心特性
 
@@ -197,15 +197,17 @@ scripts/e2e/inject-e2e.sh     # macOS 注入链路端到端自检
 
 ## 平台支持与已知限制
 
-| 平台                  | 状态                              |
-|:--------------------|:--------------------------------|
-| macOS（arm64/x86_64） | ✅ 完整（注入链路 e2e 实测）               |
+| 平台                  | 状态                                         |
+|:--------------------|:-------------------------------------------|
+| macOS（arm64/x86_64） | ✅ 完整（注入链路 e2e 实测）                          |
 | Windows（x64）        | 🚧 代码完成；CI 覆盖三平台测试与 msi/nsis 构建，注入链路尚未实机验证 |
 
 不开 TUN 的固有权衡：
 
 - 仅代理**从菜单栏启动**的应用（已运行的应用、系统服务不在管辖范围）
-- SIP 保护的系统二进制（`/usr/bin/*`）与启用 hardened runtime 的应用不可注入（launcher 启动前检测并提示替代方案）
+- SIP 保护的系统二进制（`/usr/bin/*` 等）会在启动前被明确拒绝：dyld 会静默忽略注入，进程能启动却不走代理
+- hardened runtime 的应用：Chromium 系（Chrome/Edge/Brave/Vivaldi/Opera）自动改用原生 `--proxy-server` +
+  独立配置目录；其他应用仍不可注入，会给出可操作的错误
 - 详见 [docs/USAGE.md](docs/USAGE.md) 与 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
 ## 开发

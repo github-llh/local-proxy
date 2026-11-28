@@ -103,3 +103,19 @@ scripts/e2e/inject-e2e.sh
 
 通过标准：FakeIP 生效、域名透传（mock 收到 CONNECT example.com:80）、HTTP 响应经代理到达、
 未注入流量不经核心。
+
+## 原生代理模式（hardened runtime 应用）
+
+Chrome/Edge/Brave 等 Chromium 浏览器启用了 hardened runtime，dyld 会拒绝加载注入 shim。
+LocalProxy 对这类应用**不再只报错**，而是自动改用 Chromium 自带的 `--proxy-server` 启动：
+
+- 端点固定为 LocalProxy 核心的 HTTP 端口（只接受回环地址）；
+- 使用独立 `--user-data-dir`：不与日常浏览器实例混用，也避免"已有 Chrome 在跑 → 参数被静默忽略"；
+- 代价是该实例是全新配置目录（没有日常登录态、书签、扩展）。需要登录态时请在跳出的窗口里登录；
+- 同一个应用重复启动会提示"原生代理实例已在运行"——先在菜单栏停止它，再启动。
+
+菜单栏「运行中」列表里，这类会话会标记为 **原生代理**；注入模式标记为 **注入代理**，两者可区分。
+
+**覆盖范围不同**：原生模式只接管 HTTP(S)/CONNECT，LocalProxy 会附加 `--disable-quic`
+避免 QUIC（UDP）绕过代理；WebRTC、DNS-over-HTTPS 等仍可能绕过。需要覆盖 UDP 语义的场景，
+改用 Chromium 之外可注入的客户端，或使用系统代理/TUN。

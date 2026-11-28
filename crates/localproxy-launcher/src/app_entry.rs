@@ -88,16 +88,23 @@ pub fn app_display_name(path: &Path) -> String {
     }
 }
 
-/// 生成简短唯一 ID（时间戳 + 随机，无第三方依赖）。
+/// 生成简短唯一 ID（时间戳 + 进程内序号 + pid，无第三方依赖）。
+///
+/// 旧实现只拼「纳秒 + 栈地址」：同一函数栈上栈地址恒定，两次调用落在同一纳秒
+/// 就会得到**相同 ID**（测试偶发失败已经暴露）。加了进程内单调序号后，
+/// 同进程任意频率都唯一；pid 再把跨进程的边界补上。
 pub fn new_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static LAST_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
+        .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    // 混入一个栈地址做轻量随机化（仅用于 ID，不用于安全场景）
-    let entropy = &nanos as *const u128 as usize;
-    format!("{:x}{:x}", nanos, entropy & 0xFFFFFF)
+    let seq = LAST_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{:x}{:x}{:x}", nanos, std::process::id(), seq)
 }
 
 #[cfg(test)]

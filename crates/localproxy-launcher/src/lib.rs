@@ -15,17 +15,42 @@ pub mod windows;
 
 #[cfg(target_os = "macos")]
 pub use macos::{
-    has_hardened_runtime, launch, read_plist_string, resolve_binary, LaunchError, ResolvedBinary,
-    Session,
+    has_hardened_runtime, launch, native_proxy_supported, parse_runtime_flag, read_plist_string,
+    resolve_binary, LaunchError, ResolvedBinary, Session,
 };
 
 #[cfg(target_os = "windows")]
 pub use windows::{launch, LaunchError, Session};
 
+/// 本次启动采用的方式。
+///
+/// - `Injected`：注入 shim，覆盖 getaddrinfo/connect，支持 FakeIP 与 UDP 语义；
+/// - `NativeProxy`：目标应用自己支持 `--proxy-server`（Chromium 系），不注入，
+///   用独立配置目录保证新实例真正带上代理参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchMode {
+    Injected,
+    NativeProxy,
+}
+
+impl LaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaunchMode::Injected => "injected",
+            LaunchMode::NativeProxy => "native-proxy",
+        }
+    }
+}
+
 /// 代理启动所需的实际监听端点与本次核心的运行期策略。
 pub struct LaunchConfig<'a> {
+    /// 核心 SOCKS5 端点（注入模式的 LP_CORE_*）
     pub core: std::net::SocketAddr,
+    /// 核心 HTTP 端点（原生代理模式的 `--proxy-server`，必须回环）
+    pub http: std::net::SocketAddr,
     pub policy_path: &'a std::path::Path,
+    /// 原生代理模式的独立配置目录根（每个应用一个子目录）
+    pub profile_root: &'a std::path::Path,
 }
 
 impl LaunchConfig<'_> {
