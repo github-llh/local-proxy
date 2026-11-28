@@ -105,6 +105,17 @@ cargo test -p localproxy-core config::
 cargo clippy -p localproxy-core -p localproxy-app --all-targets -- -D warnings
 ```
 
+改动 `#[cfg(target_os = ...)]` / `#[cfg(windows)]` 相关代码时，额外跑一次 Linux 交叉检查：
+
+```bash
+scripts/check-linux-cfg.sh
+```
+
+macOS 上 `cargo clippy` 只编译 macOS 分支，仅在 Windows/Linux 生效的代码（以及被 cfg 掉的
+常量、平台专用依赖）不会暴露问题。该脚本用 `x86_64-unknown-linux-gnu` target 交叉 clippy
+（只做检查、不需要 GTK），覆盖 net / core / launcher / shim\* / inject；`src-tauri` 需要
+webkit2gtk，由 CI 的 ubuntu job 覆盖。
+
 ## 4. 发布构建（安装包）
 
 macOS：
@@ -202,5 +213,6 @@ LOCALPROXY_CONFIG_DIR=/tmp/lp-test "./LocalProxy.app/Contents/MacOS/localproxy-a
 | `tauri build` 报 icon 缺失 | `cd src-tauri && ../ui/node_modules/.bin/tauri icon ../app-icon.png` |
 | Windows 构建缺 WebView2 | 安装 Microsoft Edge WebView2 Runtime，或确认 runner 自带 |
 | 目标机器上「已损坏，无法打开」 | ad hoc 签名的预期行为，右键打开或清除 quarantine；正式分发需公证 |
+| 本地 macOS 通过、CI 的 Linux job 报 `dead_code` 或 `unused dependency` | 平台专用常量/依赖没收敛到 cfg 作用域；跑 `scripts/check-linux-cfg.sh` 复现，常量放进使用它的 `cfg` 块内，依赖移到 `[target.'cfg(...)'.dependencies]` |
 
 更多运行时问题见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md)。

@@ -21,8 +21,6 @@ use crate::control_client::ControlClient;
 
 /// 单实例锁文件名（与 `config.json` 同目录）。
 const INSTANCE_LOCK_FILENAME: &str = "app.lock";
-/// 停止被代理应用时等待进程退出的上限。
-const STOP_GRACE: Duration = Duration::from_secs(2);
 /// 单实例锁的取用重试窗口（覆盖退出后立即重启）。
 const LOCK_RETRY: Duration = Duration::from_millis(1500);
 /// 单实例锁重试间隔。
@@ -76,6 +74,8 @@ impl AppSession {
     pub fn stop(&mut self) -> std::io::Result<()> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
+            // 与使用点同作用域：非目标平台（如 Linux CI）不会留下未使用常量
+            const STOP_GRACE: Duration = Duration::from_secs(2);
             self.process.kill()?;
             let deadline = std::time::Instant::now() + STOP_GRACE;
             while std::time::Instant::now() < deadline {

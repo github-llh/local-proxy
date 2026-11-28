@@ -6,8 +6,13 @@ license.workspace = true
 description = "LocalProxy 平台启动器：macOS .app 解析/exec + DYLD 注入，Windows CreateProcess + DLL 注入"
 
 [dependencies]
-localproxy-net.workspace = true
 serde.workspace = true
+
+# 仅在注入平台使用：非目标平台（Linux CI）不引入，避免未使用依赖告警。
+# `LaunchConfig::environment`（用到 localproxy-net）与 tracing 调用都位于
+# `cfg(any(target_os = "macos", target_os = "windows"))` 内。
+[target.'cfg(any(target_os = "macos", target_os = "windows"))'.dependencies]
+localproxy-net.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]

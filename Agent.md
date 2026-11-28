@@ -87,3 +87,4 @@ node scripts/build-bundle.mjs x86_64-pc-windows-msvc         # Windows（需在 
 | 打包产物缺核心/shim | 绕过了 `scripts/build-bundle.mjs` |
 | `tauri build` 报 icon 缺失 | `cd src-tauri && ../ui/node_modules/.bin/tauri icon ../app-icon.png` |
 | 产物文件名版本与 tag 不一致 | 两处版本号未同步 |
+| CI 的 ubuntu job 报 `dead_code` / `unused dependency`，macOS 本地却通过 | 平台专用代码未收敛到 cfg 作用域；本地跑 `scripts/check-linux-cfg.sh` 复现 |
