@@ -20,3 +20,4 @@ LocalProxy：跨平台本地代理（菜单栏 + per-app 启动注入，无 TUN�
 | `crates/localproxy-launcher` | 平台启动器：`.app` 解析/exec、CreateProcess 注入 |
 | `src-tauri` | Tauri 菜单栏应用（tray/popover/设置窗口/命令层） |
 | `ui` | 前端（Vite + React + TS，Claude 风格） |
+| `docs` | 文档：使用（USAGE）、构建（BUILD）、发版（RELEASE）、架构、排障 |

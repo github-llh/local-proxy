@@ -2,21 +2,11 @@
 
 ## 安装与运行
 
-开发模式：
+**安装包**：从 GitHub Release 下载 `.dmg`（macOS）/ `.msi` 或 `-setup.exe`（Windows）安装后启动，
+菜单栏出现图标即表示核心已就绪。未签名构建首次打开需右键 →「打开」，或
+`xattr -dr com.apple.quarantine /Applications/LocalProxy.app`。
 
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build -p localproxy-core -p localproxy-shim-macos
-codesign -s - target/debug/liblocalproxy_shim_macos.dylib   # arm64 必需
-cd src-tauri && ../ui/node_modules/.bin/tauri dev
-```
-
-核心也可独立运行（无 UI）：
-
-```bash
-target/debug/localproxy-core --config ./config.json
-# curl -x socks5://127.0.0.1:1080 https://example.com
-```
+**从源码运行**（含调试、CLI 用法、打包安装包）见 [BUILD.md](BUILD.md)。
 
 ## 基本使用
 
@@ -26,6 +16,18 @@ target/debug/localproxy-core --config ./config.json
 4. 右键托盘图标 →「设置」：配置监听、上游、路由规则、DNS/UDP、应用、高级项。
    设置页的改动在点击「保存」后生效（`⌘/Ctrl + S` 亦可），标题栏会提示
    「未保存的更改」；「重新加载」丢弃草稿并读取磁盘上的当前配置。
+
+设置窗口的分区：
+
+- **监听**：监听地址、SOCKS5 / HTTP CONNECT / 控制面端口、日志级别。桌面核心会避开被占用的端口，
+  面板显示实际端口，这里填写的是偏好值。
+- **上游代理**：左侧列表列出全部上游（类型 · 端点），点选查看详情；「设为使用」切换激活上游
+  （保存后生效）。新增支持预设（Clash/mihomo、v2rayN、Surge、Stash、Shadowsocks、SOCKS5、HTTP）
+  与「手动添加节点」。删除后可在同一次编辑里「撤销」。
+- **路由规则**：见下方「路由规则」，规则表可编辑全部匹配字段。
+- **DNS 与 UDP**：解析模式、UDP 模式与降级、IPv6、允许代理的端口（留空 = 全部；全部无效输入会保留原值）。
+- **应用**：登记、启用、编辑名称/备注/附加启动参数、移除。
+- **高级**：界面语言（保存后即时生效）、开机自启、出口 IP 探测端点与超时。
 
 ## 上游配置
 
@@ -86,14 +88,18 @@ mihomo。「检查节点配置」验证内核能否加载并启动该节点，�
 `dns_mode=proxy` 对已接管的公网域名查询返回 FakeIP，连接时将域名交给核心分流。`dns_mode=direct` 将新查询交回系统解析器，已缓存的
 FakeIP 仍可用于连接。显式直连规则或节点服务器需要在本地解析域名时，也会使用系统 DNS。
 
+默认 `udp_mode=auto`：按当前上游类型解析——SOCKS5 上游为 `proxy`（按规则分流），
+HTTP 上游不支持 UDP，按 `udp_fallback` 处理（默认 `block`）。
+
 | `udp_mode`  | 行为                                                   | 适用                            |
 |:------------|:-----------------------------------------------------|:------------------------------|
-| `block`（默认） | 阻断公网 UDP，返回 `ENETUNREACH` 促使应用回退 TCP                 | 防泄漏优先（API/网页场景，QUIC 自动回落 TCP） |
+| `block`     | 阻断公网 UDP，返回 `ENETUNREACH` 促使应用回退 TCP                 | 防泄漏优先（API/网页场景，QUIC 自动回落 TCP） |
 | `proxy`     | 核心按路由规则处理每个 UDP 报文，命中代理的报文通过 SOCKS5 UDP Associate 转发 | 需要 UDP 分流的场景                  |
 | `direct`    | UDP 直连放行                                             | 排障对照                          |
+| `auto`（默认） | 按上游类型解析为 `proxy`，或按 `udp_fallback` 处理                 | 多数场景                          |
 
 注入层对局域网、回环和标准 mDNS 组播保留直连。手工连接核心 SOCKS5 端口的客户端遵循核心的 UDP 策略。
-核心中继也检查「允许代理的端口」。`auto` 会按上游类型解析为 proxy（SOCKS5 上游）或按 `udp_fallback` 处理。
+核心中继也检查「允许代理的端口」。
 
 桌面配置热重载后，已启动应用的下一次受支持 DNS 查询或 UDP 发送即采用新策略。切到阻断后，已连接的公网 UDP socket
 也会在受支持的发送入口被阻断。核心退出后，发布的策略自动失效，旧会话停止向已释放的核心 TCP 端口拨号。
@@ -181,3 +187,6 @@ Windows `%APPDATA%/local-proxy/`）由 App 自动维护，也可手改：
 
 旧配置里的 `proxy_rules.dns_mode` 仍可读取：加载时会提升为顶层 `dns_mode`，
 保存后只保留顶层字段。
+
+同目录还有 `app.lock`（单实例锁，进程退出自动释放）。整个目录可用环境变量
+`LOCALPROXY_CONFIG_DIR` 覆盖，用于并行多实例或测试。

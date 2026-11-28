@@ -9,8 +9,10 @@
 </p>
 
 <p align="center">
-  <a href="docs/ARCHITECTURE.md">架构</a> ·
   <a href="docs/USAGE.md">使用</a> ·
+  <a href="docs/BUILD.md">构建</a> ·
+  <a href="docs/RELEASE.md">发版</a> ·
+  <a href="docs/ARCHITECTURE.md">架构</a> ·
   <a href="docs/TROUBLESHOOTING.md">排障</a>
 </p>
 
@@ -23,6 +25,16 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 
 不靠虚拟网卡、不靠 root/管理员权限，靠**启动注入**实现（macOS `DYLD_INSERT_LIBRARIES` + `__interpose` 段 / Windows DLL
 注入 + MinHook）。
+
+## 文档导航
+
+| 我想… | 看 |
+|:--|:--|
+| 安装并日常使用 | [docs/USAGE.md](docs/USAGE.md) |
+| 从源码构建、打安装包 | [docs/BUILD.md](docs/BUILD.md) |
+| 发布新版本 | [docs/RELEASE.md](docs/RELEASE.md) |
+| 了解内部实现 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
+| 排查问题 | [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) |
 
 ## 核心特性
 
@@ -85,21 +97,51 @@ LocalProxy 是一个轻量的跨平台本地代理（macOS 优先，Windows 适�
 
 ## 快速开始
 
-```bash
-# 前置：Rust stable、Node 22+、pnpm 9+；前端依赖已装（ui/node_modules）
-export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --workspace
+### 安装包
 
-# 方式一：完整应用（菜单栏）——注意在 src-tauri 目录调用 ui 下的 CLI
-codesign -s - target/debug/liblocalproxy_shim_macos.dylib   # macOS 首次必需
+从 GitHub Release 下载对应平台产物：
+
+- macOS：`LocalProxy_<version>_universal.dmg`（Intel + Apple Silicon 通用）
+- Windows：`LocalProxy_<version>_x64_en-US.msi` 或 `LocalProxy_<version>_x64-setup.exe`
+
+启动后菜单栏出现图标，本地核心自动拉起（SOCKS5 `1080` / HTTP CONNECT `1081` / 控制面 `1082`；
+端口被占用时自动避让，实际端口显示在面板）。未签名构建首次打开需右键 →「打开」，或
+`xattr -dr com.apple.quarantine /Applications/LocalProxy.app`。
+
+### 从源码运行
+
+```bash
+# 前置：Rust stable、Node 22+、pnpm 10
+export PATH="$HOME/.cargo/bin:$PATH"
+pnpm --dir ui install --frozen-lockfile
+
+# 完整应用（菜单栏 + 设置窗口）
+cargo build -p localproxy-core -p localproxy-shim-macos
+codesign -s - target/debug/liblocalproxy_shim_macos.dylib   # macOS 必需
 cd src-tauri && ../ui/node_modules/.bin/tauri dev
 
-# 方式二：仅核心（CLI，无 UI）
-cargo run -p localproxy-core
-curl -x socks5://127.0.0.1:1080 https://example.com   # 另一个终端
+# 仅核心（CLI，无 UI）
+cargo run -p localproxy-core -- --config ./config.json
+curl -x socks5://127.0.0.1:1080 https://example.com        # 另一个终端验证
+```
 
-# macOS 一键自检（FakeIP、非阻塞 TCP、UDP 阻断/放行和 SOCKS5 中继）
-scripts/e2e/inject-e2e.sh
+### 打安装包
+
+```bash
+node scripts/build-bundle.mjs universal-apple-darwin   # macOS：.app + .dmg
+node scripts/build-bundle.mjs x86_64-pc-windows-msvc   # Windows：.msi + nsis（需在 Windows 上执行）
+```
+
+不要直接跑 `tauri build`：核心与 shim 由构建脚本编译并注入 `bundle.resources`，直接构建的 App 会缺少它们。
+完整说明、产物路径与自检命令见 [docs/BUILD.md](docs/BUILD.md)。
+
+### 测试
+
+```bash
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+pnpm --dir ui build
+scripts/e2e/inject-e2e.sh     # macOS 注入链路端到端自检
 ```
 
 ## 使用
@@ -110,7 +152,9 @@ scripts/e2e/inject-e2e.sh
 4. **选择 Clash 节点**：在设置的上游代理中启用 Clash / mihomo 节点选择，填入控制地址和 Secret。保存后可从菜单栏面板选择策略组和节点，订阅继续由
    Clash 管理。参见 [使用指南](docs/USAGE.md#在-localproxy-中切换-clash-节点)。
 5. **手动节点**：在上游设置中手动添加节点，使用本机 mihomo。参见 [独立节点说明](docs/USAGE.md#手动添加独立节点)。
-6. **规则**：设置窗口编辑（域名 `.cn` 后缀、`*.example.com` 通配、CIDR、端口、协议），内网/回环自动直连。
+6. **规则**：设置窗口的规则表可编辑域名（`.cn` 后缀、`*.example.com` 通配）、IPv4/IPv6 CIDR、
+   端口（`443`、`10000-20000`）、协议与优先级；`order` 模式用 ↑↓ 调整顺序，`number` 模式按优先级降序；
+   内网/回环默认自动直连。
 
 ## 安全模型
 
@@ -126,24 +170,37 @@ scripts/e2e/inject-e2e.sh
 {
   "socks5_port": 1080,
   "http_port": 1081,
+  "control_port": 1082,
   "upstream": {
     "active": "clash",
     "servers": [{ "id": "clash", "name": "Clash", "type": "socks5",
                    "host": "127.0.0.1", "port": 7890 }]
   },
-  "routing": { "default_action": "proxy", "use_default_private": true },
-  "proxy_rules": { "udp_mode": "block", "ipv6_mode": "proxy" },
+  "routing": {
+    "enabled": true,
+    "priority_mode": "order",
+    "default_action": "proxy",
+    "use_default_private": true,
+    "rules": [{ "id": "rule-0", "name": "内网域名", "action": "direct",
+                "domains": [".corp.example.com"], "ports": ["443"],
+                "protocols": ["tcp"] }]
+  },
+  "dns_mode": "proxy",
+  "proxy_rules": { "udp_mode": "auto", "udp_fallback": "block", "ipv6_mode": "proxy" },
   "apps": [{ "id": "chrome", "name": "Chrome",
              "path": "/Applications/Google Chrome.app" }]
 }
 ```
+
+完整字段、旧配置迁移与规则语义见 [docs/USAGE.md](docs/USAGE.md#配置文件)。
+`LOCALPROXY_CONFIG_DIR` 可指向独立目录以并行运行多个实例。
 
 ## 平台支持与已知限制
 
 | 平台                  | 状态                              |
 |:--------------------|:--------------------------------|
 | macOS（arm64/x86_64） | ✅ 完整（注入链路 e2e 实测）               |
-| Windows（x64）        | 🚧 代码完成，CI 验证（编译由 CI 覆盖，未在本机验证） |
+| Windows（x64）        | 🚧 代码完成；CI 覆盖三平台测试与 msi/nsis 构建，注入链路尚未实机验证 |
 
 不开 TUN 的固有权衡：
 
@@ -153,11 +210,14 @@ scripts/e2e/inject-e2e.sh
 
 ## 开发
 
+构建、测试、打包与产物自检的完整流程见 [docs/BUILD.md](docs/BUILD.md)；发版流程见
+[docs/RELEASE.md](docs/RELEASE.md)。提交前的最低要求：
+
 ```bash
-cargo test --workspace                       # 全量测试
-cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-pnpm --dir ui build                          # 前端
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+pnpm --dir ui build
 ```
 
 ## 许可

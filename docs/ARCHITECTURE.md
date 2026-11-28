@@ -1,5 +1,7 @@
 # LocalProxy 架构
 
+> 构建见 [BUILD.md](BUILD.md)，发版见 [RELEASE.md](RELEASE.md)，使用见 [USAGE.md](USAGE.md)。
+
 ## 总览
 
 ```
