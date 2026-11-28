@@ -79,17 +79,69 @@ impl Default for ClashController {
     }
 }
 
+/// Clash 控制面端点。
+///
+/// 两种形态都要支持：mihomo / ClashX 等监听 TCP 回环端口，
+/// Clash Verge Rev 默认通过 Unix domain socket 暴露控制面
+/// （`verge-mihomo -ext-ctl-unix /tmp/verge-mihomo.sock`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClashEndpoint {
+    /// `host:port`
+    Tcp(std::net::SocketAddr),
+    /// Unix domain socket 绝对路径
+    Unix(std::path::PathBuf),
+}
+
 impl ClashController {
-    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, String> {
-        self.address
-            .trim()
-            .parse::<std::net::SocketAddr>()
+    /// 解析控制面端点。
+    ///
+    /// 接受三种写法：
+    /// - `127.0.0.1:9097`（TCP，仅回环）
+    /// - `unix:/path/to.sock` / `unix:///path/to.sock`
+    /// - 裸绝对路径 `/path/to.sock`
+    pub fn endpoint(&self) -> Result<ClashEndpoint, String> {
+        let raw = self.address.trim();
+        if raw.is_empty() {
+            return Err("Clash 控制地址为空".to_string());
+        }
+        if let Some(rest) = raw.strip_prefix("unix:") {
+            return unix_endpoint(rest);
+        }
+        if raw.starts_with('/') {
+            return unix_endpoint(raw);
+        }
+        raw.parse::<std::net::SocketAddr>()
             .ok()
             .filter(|addr| addr.ip().is_loopback() && addr.port() != 0)
+            .map(ClashEndpoint::Tcp)
             .ok_or_else(|| {
-                "Clash 控制地址需要是本机回环 IP 和端口，例如 127.0.0.1:9090".to_string()
+                "Clash 控制地址需要是本机回环 IP 和端口（如 127.0.0.1:9097），\
+                 或 Unix socket 路径（unix:/path/to/sock）"
+                    .to_string()
             })
     }
+
+    /// TCP 端口（Unix socket 控制面没有）。
+    pub fn socket_addr(&self) -> Result<std::net::SocketAddr, String> {
+        match self.endpoint()? {
+            ClashEndpoint::Tcp(addr) => Ok(addr),
+            ClashEndpoint::Unix(_) => {
+                Err("Clash 控制面使用 Unix socket，没有 TCP 端口".to_string())
+            }
+        }
+    }
+}
+
+fn unix_endpoint(raw: &str) -> Result<ClashEndpoint, String> {
+    let path = raw.trim().trim_start_matches("//");
+    if path.is_empty() {
+        return Err("Clash 控制 socket 路径为空".to_string());
+    }
+    let path = std::path::PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err("Clash 控制 socket 需要绝对路径".to_string());
+    }
+    Ok(ClashEndpoint::Unix(path))
 }
 
 impl UpstreamServer {
@@ -718,7 +770,7 @@ impl AppConfig {
                 return Err(format!("上游 {}({}) 端口为 0", server.name, server.id));
             }
             if let Some(clash) = &server.clash {
-                clash.socket_addr()?;
+                clash.endpoint()?;
             }
             if let Some(node) = &server.managed {
                 if server.host.trim().is_empty()

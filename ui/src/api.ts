@@ -37,6 +37,13 @@ export interface ClashState {
   groups: { name: string; selected: string; choices: string[] }[];
 }
 
+export interface DiscoveredClash {
+  address: string;
+  secret: string;
+  source: string;
+  version: string;
+}
+
 export interface AppEntry {
   id: string;
   name: string;
@@ -175,6 +182,9 @@ export const api = {
   getClashState: (upstreamId: string) => invoke<ClashState>("get_clash_state", {upstreamId}),
   selectClashProxy: (upstreamId: string, group: string, choice: string) =>
     invoke<void>("select_clash_proxy", {upstreamId, group, choice}),
+  discoverClash: () => invoke<DiscoveredClash>("discover_clash"),
+  applyClashController: (upstreamId: string, address: string, secret: string) =>
+    invoke<void>("apply_clash_controller", {upstreamId, address, secret}),
 };
 
 // 选择应用文件（.app / .exe / 可执行文件）。

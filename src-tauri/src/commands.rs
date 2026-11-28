@@ -157,38 +157,46 @@ pub fn list_sessions(state: State<'_, AppState>) -> Vec<SessionInfo> {
 
 /// 登记新应用（.app / .exe 路径）。
 #[tauri::command]
-pub fn add_app(state: State<'_, AppState>, path: String) -> Result<AppEntry, String> {
+pub async fn add_app(state: State<'_, AppState>, path: String) -> Result<AppEntry, String> {
     let entry = AppEntry::from_path(Path::new(&path))
         .ok_or_else(|| format!("路径不存在或不是有效应用: {path}"))?;
-    state.mutate_local(|config| {
-        if config
-            .apps
-            .iter()
-            .any(|registered| registered.path == entry.path)
-        {
-            return Err("该应用已登记".to_string());
-        }
-        config.apps.push(entry.clone());
-        Ok(entry.clone())
-    })
+    let (_, created) = state
+        .commit_local(move |current| {
+            if current
+                .apps
+                .iter()
+                .any(|registered| registered.path == entry.path)
+            {
+                return Err("该应用已登记".to_string());
+            }
+            let mut next = current.clone();
+            next.apps.push(entry.clone());
+            Ok((next, entry.clone()))
+        })
+        .await?;
+    Ok(created)
 }
 
 /// 移除应用登记。
 #[tauri::command]
-pub fn remove_app(state: State<'_, AppState>, id: String) -> Result<(), String> {
-    state.mutate_local(move |config| {
-        let before = config.apps.len();
-        config.apps.retain(|app| app.id != id);
-        if config.apps.len() == before {
-            return Err("应用不存在".to_string());
-        }
-        Ok(())
-    })
+pub async fn remove_app(state: State<'_, AppState>, id: String) -> Result<(), String> {
+    state
+        .commit_local(move |current| {
+            let mut next = current.clone();
+            let before = next.apps.len();
+            next.apps.retain(|app| app.id != id);
+            if next.apps.len() == before {
+                return Err("应用不存在".to_string());
+            }
+            Ok((next, ()))
+        })
+        .await
+        .map(|_| ())
 }
 
 /// 更新应用登记（名称 / 备注 / 附加参数 / 启用状态）。
 #[tauri::command]
-pub fn update_app(
+pub async fn update_app(
     state: State<'_, AppState>,
     id: String,
     name: Option<String>,
@@ -196,29 +204,37 @@ pub fn update_app(
     extra_args: Option<Vec<String>>,
     enabled: Option<bool>,
 ) -> Result<AppEntry, String> {
-    state.mutate_local(move |config| {
-        let app = config
-            .apps
-            .iter_mut()
-            .find(|app| app.id == id)
-            .ok_or_else(|| "应用不存在".to_string())?;
-        if let Some(name) = name {
-            let trimmed = name.trim();
-            if !trimmed.is_empty() {
-                app.name = trimmed.to_string();
-            }
-        }
-        if let Some(note) = note {
-            app.note = note;
-        }
-        if let Some(extra_args) = extra_args {
-            app.extra_args = extra_args;
-        }
-        if let Some(enabled) = enabled {
-            app.enabled = enabled;
-        }
-        Ok(app.clone())
-    })
+    let (_, updated) = state
+        .commit_local(move |current| {
+            let mut next = current.clone();
+            // 借用只在块内，之后才能移动 next
+            let updated = {
+                let app = next
+                    .apps
+                    .iter_mut()
+                    .find(|app| app.id == id)
+                    .ok_or_else(|| "应用不存在".to_string())?;
+                if let Some(name) = name {
+                    let trimmed = name.trim();
+                    if !trimmed.is_empty() {
+                        app.name = trimmed.to_string();
+                    }
+                }
+                if let Some(note) = note {
+                    app.note = note;
+                }
+                if let Some(extra_args) = extra_args {
+                    app.extra_args = extra_args;
+                }
+                if let Some(enabled) = enabled {
+                    app.enabled = enabled;
+                }
+                app.clone()
+            };
+            Ok((next, updated))
+        })
+        .await?;
+    Ok(updated)
 }
 
 /// 以代理模式启动应用（注入 shim）。
@@ -332,20 +348,24 @@ fn now_unix_secs() -> u64 {
 
 /// 设置应用启用状态（popover 快速开关）。
 #[tauri::command]
-pub fn set_app_enabled(
+pub async fn set_app_enabled(
     state: State<'_, AppState>,
     id: String,
     enabled: bool,
 ) -> Result<(), String> {
-    state.mutate_local(move |config| {
-        let app = config
-            .apps
-            .iter_mut()
-            .find(|app| app.id == id)
-            .ok_or_else(|| "应用不存在".to_string())?;
-        app.enabled = enabled;
-        Ok(())
-    })
+    state
+        .commit_local(move |current| {
+            let mut next = current.clone();
+            let app = next
+                .apps
+                .iter_mut()
+                .find(|app| app.id == id)
+                .ok_or_else(|| "应用不存在".to_string())?;
+            app.enabled = enabled;
+            Ok((next, ()))
+        })
+        .await
+        .map(|_| ())
 }
 
 #[derive(serde::Serialize)]
@@ -502,10 +522,12 @@ pub async fn save_config(
         if let Err(e) = result {
             // 自启设置失败时同步回滚内存和配置文件中的标记。
             state
-                .mutate_local(move |current| {
-                    current.ui.launch_at_login = !launch_at_login;
-                    Ok(())
+                .commit_local(move |current| {
+                    let mut next = current.clone();
+                    next.ui.launch_at_login = !launch_at_login;
+                    Ok((next, ()))
                 })
+                .await
                 .ok();
             return Err(format!("开机自启设置失败: {e}"));
         }
@@ -529,6 +551,54 @@ pub async fn select_upstream(state: State<'_, AppState>, id: String) -> Result<(
             }
             let mut next = current.clone();
             next.upstream.active = id;
+            Ok((next, ()))
+        })
+        .await
+        .map(|_| ())
+}
+
+/// 自动发现本机 Clash / mihomo 控制面（读客户端配置 + 探测常见端口）。
+///
+/// 不依赖系统代理：只连回环地址，也不要求 Clash 开启系统代理或 TUN。
+#[tauri::command]
+pub async fn discover_clash(
+    state: State<'_, AppState>,
+) -> Result<crate::clash_discovery::DiscoveredClash, String> {
+    // 串行化：检测会读配置、跑 ps、逐端口探测，连点没必要重复
+    let _serial = state.discover_lock().lock().await;
+    crate::clash_discovery::discover().await
+}
+
+/// 把自动发现的控制面写回指定上游（popover 出错时就地修复）。
+///
+/// 控制地址只被桌面端读取、内核不关心，所以走本地写入而不触发核心重载；
+/// 地址格式在这里先校验，避免把「Clash 未运行」变成配置写入失败。
+#[tauri::command]
+pub async fn apply_clash_controller(
+    state: State<'_, AppState>,
+    upstream_id: String,
+    address: String,
+    secret: String,
+) -> Result<(), String> {
+    let controller = localproxy_core::config::ClashController {
+        address: address.trim().to_string(),
+        // 复制粘贴常带首尾空白，这里统一去掉
+        secret: secret.trim().to_string(),
+    };
+    controller.endpoint()?;
+    state
+        .commit_local(move |current| {
+            let mut next = current.clone();
+            let server = next
+                .upstream
+                .servers
+                .iter_mut()
+                .find(|server| server.id == upstream_id)
+                .ok_or_else(|| "上游不存在".to_string())?;
+            if server.managed.is_some() {
+                return Err("独立节点不使用 Clash 控制地址".to_string());
+            }
+            server.clash = Some(controller);
             Ok((next, ()))
         })
         .await

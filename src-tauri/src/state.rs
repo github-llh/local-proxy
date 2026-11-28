@@ -4,8 +4,10 @@
 //! - 读命令只短暂持有 `config` / `core` / `sessions`，绝不跨 IO 或等待子进程；
 //! - 需要核心重载的配置提交统一走 [`AppState::commit_config`]，
 //!   只在 `apply_lock` 内串行，网络等待（控制面 reload）不持有配置锁；
-//! - 不影响内核的本地写入（应用登记、最近启动时间）走 [`AppState::mutate_local`]，
-//!   全程持锁完成「改内存 + 落盘」，避免读改写窗口丢失其他改动；
+//! - 不影响内核的配置写入（应用登记、控制面地址）走 [`AppState::commit_local`]：
+//!   与 [`AppState::commit_config`] 共用同一把提交锁，不触发核心重载，
+//!   也不会被重载失败后的回滚覆盖；
+//! - 只影响显示元数据、可丢弃的写入（最近启动时间）走 [`AppState::mutate_local`]；
 //! - 应用为单实例：配置目录下的 `app.lock` 由进程持有，第二个实例直接退出。
 
 use std::collections::HashMap;
@@ -109,6 +111,8 @@ pub struct AppState {
     spawn_lock: Mutex<()>,
     /// 同一上游的连通性测试串行化，避免并发拉起多个独立内核
     probe_keys: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 控制面自动检测串行化：避免连点触发多个 `ps` + 端口探测
+    discover_lock: tokio::sync::Mutex<()>,
     /// 单实例文件锁句柄：进程存活期间持有，退出时由系统释放
     _instance_lock: std::fs::File,
 }
@@ -137,14 +141,15 @@ impl AppState {
             apply_lock: tokio::sync::Mutex::new(()),
             spawn_lock: Mutex::new(()),
             probe_keys: Mutex::new(HashMap::new()),
+            discover_lock: tokio::sync::Mutex::new(()),
             _instance_lock: instance_lock,
         }
     }
 
-    /// 本地写入：不影响内核运行，全程持锁完成「改内存 + 落盘」。
+    /// 尽力而为的本地写入：只持配置锁，不与提交串行。
     ///
-    /// 适用于应用登记、启用状态、最近启动时间等字段；`apps` 由
-    /// `save_config` 主动保留，因此无需触发核心重载。
+    /// 仅用于可丢弃的显示元数据（最近启动时间）。可能被并发的提交覆盖，
+    /// 这在这里是可接受的；需要保持一致性的写入请用 [`Self::commit_local`]。
     pub fn mutate_local<T>(
         &self,
         edit: impl FnOnce(&mut AppConfig) -> Result<T, String>,
@@ -153,6 +158,22 @@ impl AppState {
         let value = edit(&mut config)?;
         config.save(&self.config_path)?;
         Ok(value)
+    }
+
+    /// 提交不影响内核的配置（应用登记、控制面地址、自启标记等）。
+    ///
+    /// 与 [`Self::commit_config`] 共用 `apply_lock`：既不会被核心重载失败后的
+    /// 回滚覆盖，也不会触发多余的重载。调用方负责校验自己改动的字段。
+    pub async fn commit_local<T>(
+        &self,
+        build: impl FnOnce(&AppConfig) -> Result<(AppConfig, T), String>,
+    ) -> Result<(AppConfig, T), String> {
+        let _apply = self.apply_lock.lock().await;
+        let current = lock_recover(&self.config).clone();
+        let (next, value) = build(&current)?;
+        next.save(&self.config_path)?;
+        *lock_recover(&self.config) = next.clone();
+        Ok((next, value))
     }
 
     /// 提交需要内核生效的配置。
@@ -235,6 +256,11 @@ impl AppState {
             config.control_endpoint(),
             config.control_token.clone(),
         ))
+    }
+
+    /// 控制面自动检测串行锁。
+    pub fn discover_lock(&self) -> &tokio::sync::Mutex<()> {
+        &self.discover_lock
     }
 
     /// 取得某个上游的探测锁，同一上游的并发测试合并为串行。

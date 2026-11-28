@@ -2028,7 +2028,6 @@ dependencies = [
  "localproxy-core",
  "localproxy-launcher",
  "localproxy-net",
- "reqwest",
  "serde",
  "serde_json",
  "tauri",

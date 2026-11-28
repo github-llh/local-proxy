@@ -47,6 +47,22 @@ export default function ClashSelection({upstreamId, onChanged}: {
   const mode = snapshot?.mode;
   const modeHint = mode === "rule" || mode === "global" || mode === "direct" ? t(`clash.mode.${mode}`) : null;
 
+  // 控制地址/Secret 填错时就地发现并写回配置，不用再翻设置页
+  const autoFix = async () => {
+    setSwitching(true);
+    setError(null);
+    try {
+      const found = await api.discoverClash();
+      await api.applyClashController(upstreamId, found.address, found.secret);
+      onChanged();
+      refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSwitching(false);
+    }
+  };
+
   const select = async (choice: string) => {
     if (!group || !choice || busy) return;
     setSwitching(true);
@@ -70,7 +86,21 @@ export default function ClashSelection({upstreamId, onChanged}: {
           {loading ? t("settings.loading") : t("clash.refresh")}
         </button>
       </div>
-      {error && <p className="error" role="alert">{error}</p>}
+      {error && (
+        <>
+          <p className="error" role="alert">{error}</p>
+          <div className="row-actions">
+            <button
+              className="btn btn-small btn-primary"
+              onClick={autoFix}
+              disabled={busy}
+            >
+              {t("clash.autoFix")}
+            </button>
+            <span className="muted">{t("clash.autoFixHint")}</span>
+          </div>
+        </>
+      )}
       {snapshot && (
         <div className="card">
           {modeHint && <p className="muted">{modeHint}</p>}

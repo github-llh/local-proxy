@@ -12,10 +12,13 @@ use tauri::Manager;
 
 mod autostart;
 mod clash;
+mod clash_discovery;
 mod commands;
 mod control_client;
 mod probe;
 mod state;
+#[cfg(test)]
+mod test_util;
 mod tray;
 
 /// 启动 Tauri 应用。
@@ -74,6 +77,8 @@ pub fn run() {
             commands::select_upstream,
             commands::get_clash_state,
             commands::select_clash_proxy,
+            commands::discover_clash,
+            commands::apply_clash_controller,
         ])
         .run(tauri::generate_context!())
         .expect("启动 LocalProxy 失败");

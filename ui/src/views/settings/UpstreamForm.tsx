@@ -2,7 +2,7 @@
 
 import {useState} from "react";
 import {open} from "@tauri-apps/plugin-dialog";
-import {api, type AppConfig, type UpstreamServer} from "../../api";
+import {api, type AppConfig, type ClashController, type UpstreamServer} from "../../api";
 import {useT} from "../../i18n";
 import {Field, NumberInput, Toggle} from "../../components/fields";
 import ManagedNodeEditor from "../ManagedNodeEditor";
@@ -130,9 +130,10 @@ export default function UpstreamForm({
           {server.clash && (
             <>
               <div className="form-grid">
-                <Field label={t("clash.address")}>
+                <Field label={t("clash.address")} hint={t("clash.addressHint")}>
                   <input
                     value={server.clash.address}
+                    placeholder="127.0.0.1:9097 或 unix:/path/to/clash.sock"
                     spellCheck={false}
                     autoComplete="off"
                     onChange={(event) =>
@@ -155,11 +156,58 @@ export default function UpstreamForm({
                   />
                 </Field>
               </div>
+              <ClashDetect
+                onDetected={(controller) =>
+                  onServer((item) => (item.clash = controller))
+                }
+              />
               <p className="muted">{t("clash.settingsHint")}</p>
+              <p className="muted">{t("clash.noSystemProxy")}</p>
             </>
           )}
         </>
       )}
+    </>
+  );
+}
+
+/// 「自动检测」：从 Clash 运行配置或常见控制端口里找出可用的控制面。
+function ClashDetect({
+  onDetected,
+}: {
+  onDetected: (controller: ClashController) => void;
+}) {
+  const t = useT();
+  const [detecting, setDetecting] = useState(false);
+  const [result, setResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const detect = async () => {
+    setDetecting(true);
+    setResult(null);
+    setError(null);
+    try {
+      const found = await api.discoverClash();
+      onDetected({address: found.address, secret: found.secret});
+      setResult(
+        `${t("clash.detected")} ${found.address} · ${found.version} · ${found.source} · ${t("settings.saveToApply")}`
+      );
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setDetecting(false);
+    }
+  };
+
+  return (
+    <>
+      <div className="row-actions">
+        <button className="btn btn-small" onClick={detect} disabled={detecting}>
+          {detecting ? t("settings.loading") : t("clash.autoDetect")}
+        </button>
+        {result && <span className="muted" role="status">{result}</span>}
+      </div>
+      {error && <p className="error" role="alert">{error}</p>}
     </>
   );
 }

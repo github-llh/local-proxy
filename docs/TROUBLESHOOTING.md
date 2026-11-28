@@ -17,6 +17,23 @@
 - macOS：提示 hardened runtime → 该应用无法注入，见 [USAGE](USAGE.md#已知限制不开-tun-的固有权衡)；
 - Windows：提示受安全软件保护 → 检查 AV/EDR 拦截，或换非保护进程验证。
 
+## Clash 节点提示「控制请求失败」
+
+popover 的「Clash 节点」卡片报「无法连接 Clash 控制端口…」「鉴权失败」或拿不到策略组时：
+
+- **控制地址与实际不符**：mihomo / ClashX 常用 `127.0.0.1:9090`；**Clash Verge Rev 默认用
+  Unix socket**（`verge-mihomo -ext-ctl-unix /var/folders/.../verge-mihomo.sock`），
+  配置模板里的 `9097` 并未监听 TCP，所以连 `9097` 会失败。
+- **Secret 不符**：Clash Verge Rev 会随机生成 Secret，手填容易出错。
+- **解决**：在卡片上点「自动检测并修复」，或设置 → 上游代理 → Clash 区块点「自动检测」。
+  检测会读取客户端运行配置（拿到 Secret）、扫描进程参数与临时目录里的 `mihomo`/`clash`
+  socket、再探测常见 TCP 端口，并用 `/version` 校验；成功后自动填入
+  `unix:/...` 或 `127.0.0.1:port`。
+- 手动填写时控制地址支持两种写法：`127.0.0.1:9097`、`unix:/path/to/clash.sock`。
+
+与系统代理无关：LocalProxy 只用 Clash 的代理端口与控制端口，**不需要**开启 Clash 的系统代理或
+TUN；反过来，开启系统代理也不会影响控制请求（控制请求显式绕过代理）。
+
 ## 应用能上网但出口 IP 没变
 
 - 该应用可能绕过了 BSD socket（自建网络栈或使用内核旁路）；

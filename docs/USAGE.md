@@ -50,11 +50,22 @@
 
 ### 在 LocalProxy 中切换 Clash 节点
 
-1. 在 Clash / mihomo 中开启本机 `external-controller`，如 `127.0.0.1:9090`，并确认 `secret`。代理端口通常是 `mixed-port`，如
-   `7890`。
-2. 在 LocalProxy「设置 → 上游代理」填写该 Clash 实例的代理地址和端口，启用「Clash / mihomo 节点选择」，填写控制地址与 Secret
-   后保存。控制地址接受本机回环 IP 与端口，Secret 随应用配置保存在本机。
-3. 打开菜单栏面板的「Clash 节点」，选择策略组和节点。「刷新」会读取 Clash 当前的选择及订阅更新后的列表。
+1. 确认 Clash 的控制面监听方式：
+   - mihomo / ClashX / Clash for Windows：TCP 回环端口，如 `127.0.0.1:9090`，Secret 可能为空；
+   - **Clash Verge Rev：默认使用 Unix domain socket**（`verge-mihomo -ext-ctl-unix
+     /var/folders/.../verge-mihomo.sock`），配置模板里的 `9097` 通常**并未监听 TCP**，
+     且 Secret 是随机值。
+2. 在 LocalProxy「设置 → 上游代理」填写该 Clash 实例的代理地址与端口（通常是 `mixed-port`，如 `7897`），
+   启用「Clash / mihomo 节点选择」。控制地址可以填：
+   - `127.0.0.1:9097`（TCP，仅回环）；
+   - `unix:/path/to/verge-mihomo.sock`（Unix socket）。
+3. 不确定时点「自动检测」：它会读 Clash 的运行配置拿 Secret，扫描进程参数与临时目录里的
+   `mihomo`/`clash` socket，并用 `/version` 校验，成功后自动填入。
+4. 打开菜单栏面板的「Clash 节点」，选择策略组和节点。「刷新」会读取 Clash 当前的选择及订阅更新后的列表。
+   卡片报错时可以直接点「自动检测并修复」，不需要再回设置页。
+
+LocalProxy **不需要**开启 Clash 的系统代理或 TUN：它只连接 Clash 的代理端口（转发流量）
+与控制端口（切换节点），系统代理、PAC、TUN 都由 Clash 自己管理。
 
 规则模式下，Clash 按目标匹配策略组。全局模式下，`GLOBAL` 策略组决定出口。在 LocalProxy 切换节点会更新 Clash
 的共享策略组，也会影响使用该组的其他流量。订阅导入和更新在 Clash 中完成。可用策略组取决于当前订阅配置。
