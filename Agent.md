@@ -60,6 +60,7 @@ gh run list --workflow release.yml --limit 3
 ```bash
 pnpm --dir ui install --frozen-lockfile
 # macOS（需要安装 arm64 和 x86_64 Rust target）
+rustup target add x86_64-apple-darwin
 node scripts/build-bundle.mjs universal-apple-darwin
 # Windows（需要安装 MSVC x64 Rust target）
 node scripts/build-bundle.mjs x86_64-pc-windows-msvc

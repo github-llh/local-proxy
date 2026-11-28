@@ -8,8 +8,10 @@ use tauri::{
 
 /// popover 窗口尺寸。
 const POPOVER_SIZE: (f64, f64) = (360.0, 520.0);
-/// 设置窗口尺寸。
-const SETTINGS_SIZE: (f64, f64) = (760.0, 600.0);
+/// 设置窗口尺寸（规则表横向较宽，默认给足空间）。
+const SETTINGS_SIZE: (f64, f64) = (960.0, 780.0);
+/// 设置窗口最小尺寸。
+const SETTINGS_MIN_SIZE: (f64, f64) = (720.0, 520.0);
 
 /// 初始化托盘与全部窗口。
 pub fn setup(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
@@ -78,6 +80,7 @@ fn create_windows(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
     WebviewWindowBuilder::new(app, "settings", tauri::WebviewUrl::App("index.html".into()))
         .title("LocalProxy 设置")
         .inner_size(SETTINGS_SIZE.0, SETTINGS_SIZE.1)
+        .min_inner_size(SETTINGS_MIN_SIZE.0, SETTINGS_MIN_SIZE.1)
         .center()
         .visible(false)
         .build()?;

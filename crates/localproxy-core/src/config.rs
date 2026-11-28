@@ -153,6 +153,8 @@ impl UpstreamSettings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RoutingRule {
+    /// 稳定标识（界面行 key；缺失时由 `sanitize` 补齐）
+    pub id: String,
     pub name: String,
     pub enabled: bool,
     /// `proxy` / `direct`
@@ -172,6 +174,7 @@ pub struct RoutingRule {
 impl Default for RoutingRule {
     fn default() -> Self {
         Self {
+            id: String::new(),
             name: String::new(),
             enabled: true,
             action: "proxy".to_string(),
@@ -216,32 +219,29 @@ impl Default for RoutingSettings {
 /// 代理行为规则（端口白名单 / DNS / IPv6 / UDP）。
 ///
 /// 字段语义移植旧 `Core::ProxyRules`。
+///
+/// DNS 模式只保留顶层 `AppConfig::dns_mode` 单一事实来源；旧配置中的
+/// `proxy_rules.dns_mode` 由 [`AppConfig::from_json_str`] 读取期提升。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProxyRules {
     /// 允许代理的目标端口白名单（空 = 全部）
     pub allowed_ports: Vec<u16>,
-    /// `direct` / `proxy`
-    pub dns_mode: String,
     /// `proxy` / `direct` / `block`
     pub ipv6_mode: String,
     /// `auto` / `block` / `direct` / `proxy`
     pub udp_mode: String,
     /// UDP 代理失败降级：`block` / `direct`
     pub udp_fallback: String,
-    /// 路由规则
-    pub routing: RoutingSettings,
 }
 
 impl Default for ProxyRules {
     fn default() -> Self {
         Self {
             allowed_ports: vec![80, 443],
-            dns_mode: DEFAULT_DNS_MODE.to_string(),
             ipv6_mode: DEFAULT_IPV6_MODE.to_string(),
             udp_mode: DEFAULT_UDP_MODE.to_string(),
             udp_fallback: DEFAULT_UDP_FALLBACK.to_string(),
-            routing: RoutingSettings::default(),
         }
     }
 }
@@ -295,8 +295,6 @@ pub struct UiSettings {
     pub language: String,
     /// 开机自启
     pub launch_at_login: bool,
-    /// App 退出后核心是否继续常驻
-    pub keep_core_alive: bool,
     /// 出口 IP 探测（默认关闭，避免无谓联网）
     pub exit_ip_probe: bool,
 }
@@ -306,7 +304,6 @@ impl Default for UiSettings {
         Self {
             language: "zh-CN".to_string(),
             launch_at_login: false,
-            keep_core_alive: false,
             exit_ip_probe: false,
         }
     }
@@ -545,6 +542,26 @@ impl AppConfig {
             ));
             self.routing.default_action = "proxy".to_string();
         }
+        // 规则 id：缺失或重复时按序号补齐，保证界面行 key 稳定且唯一。
+        {
+            let mut used: Vec<String> = Vec::with_capacity(self.routing.rules.len());
+            for (index, rule) in self.routing.rules.iter_mut().enumerate() {
+                let current = rule.id.trim().to_string();
+                let unique = !current.is_empty() && !used.contains(&current);
+                if !unique {
+                    let mut candidate = format!("rule-{index}");
+                    let mut suffix = 1usize;
+                    while used.contains(&candidate) {
+                        candidate = format!("rule-{index}-{suffix}");
+                        suffix += 1;
+                    }
+                    rule.id = candidate;
+                } else {
+                    rule.id = current;
+                }
+                used.push(rule.id.clone());
+            }
+        }
         for rule in &mut self.routing.rules {
             rule.action = rule.action.trim().to_ascii_lowercase();
             if rule.action != "proxy" && rule.action != "direct" {
@@ -568,14 +585,6 @@ impl AppConfig {
         let rules = &mut self.proxy_rules;
         rules.allowed_ports.sort_unstable();
         rules.allowed_ports.dedup();
-        rules.dns_mode = rules.dns_mode.trim().to_ascii_lowercase();
-        if rules.dns_mode != "direct" && rules.dns_mode != "proxy" {
-            warnings.push(format!(
-                "配置: proxy_rules.dns_mode 无效({})，已回退 proxy",
-                rules.dns_mode
-            ));
-            rules.dns_mode = DEFAULT_DNS_MODE.to_string();
-        }
         rules.ipv6_mode = rules.ipv6_mode.trim().to_ascii_lowercase();
         if rules.ipv6_mode != "proxy" && rules.ipv6_mode != "direct" && rules.ipv6_mode != "block" {
             warnings.push(format!(
@@ -610,8 +619,6 @@ impl AppConfig {
             ));
             self.dns_mode = DEFAULT_DNS_MODE.to_string();
         }
-
-        self.proxy_rules.dns_mode.clone_from(&self.dns_mode);
 
         if !warnings.is_empty() {
             for w in &warnings {
@@ -725,30 +732,6 @@ impl AppConfig {
         }
         Ok(())
     }
-
-    /// 探测端口是否可绑定（启动前预检，给出友好错误）。
-    pub fn check_ports_available(&self) -> Result<(), String> {
-        for (name, host, port) in [
-            ("SOCKS5", self.listen_host.as_str(), self.socks5_port),
-            ("HTTP CONNECT", self.listen_host.as_str(), self.http_port),
-            ("控制面", DEFAULT_LISTEN_HOST, self.control_port),
-        ] {
-            match std::net::TcpListener::bind((host, port)) {
-                Ok(_) => {} // 立即 drop，仅探测
-                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                    return Err(format!(
-                        "{name} 端口 {} 已被占用（可能是 Clash/V2RayN 等代理软件或其它实例）。\
-                         请在设置中修改端口后重试。",
-                        port
-                    ));
-                }
-                Err(e) => {
-                    return Err(format!("{name} 端口 {} 绑定失败: {e}", port));
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 /// 生成随机 hex token（时间熵 + 栈地址熵，非密码学强度但足够本机鉴权）。
@@ -823,6 +806,23 @@ mod tests {
     }
 
     #[test]
+    fn rule_ids_are_filled_and_deduplicated() {
+        let json = r#"{"routing": {"rules": [
+            {"name": "keep", "id": "alpha"},
+            {"name": "missing"},
+            {"name": "duplicate", "id": "alpha"}
+        ]}}"#;
+        let cfg = AppConfig::from_json_str(json).unwrap();
+        let ids: Vec<&str> = cfg.routing.rules.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids[0], "alpha");
+        assert_eq!(ids[1], "rule-1");
+        assert_eq!(ids[2], "rule-2");
+        // 二次 sanitize 结果稳定
+        let again = AppConfig::from_json_str(&cfg.to_json_pretty().unwrap()).unwrap();
+        assert_eq!(again, cfg);
+    }
+
+    #[test]
     fn https_upstream_treated_as_http() {
         let json = r#"{"upstream": {"servers": [{"id":"x","type":"https"}]}}"#;
         let mut cfg = AppConfig::from_json_str(json).unwrap();
@@ -834,11 +834,15 @@ mod tests {
     fn legacy_dns_mode_is_used_only_when_top_level_mode_is_absent() {
         let legacy = AppConfig::from_json_str(r#"{"proxy_rules":{"dns_mode":"direct"}}"#).unwrap();
         assert!(legacy.network_policy().dns_direct);
+        assert_eq!(legacy.dns_mode, "direct");
         let explicit =
             AppConfig::from_json_str(r#"{"dns_mode":"proxy","proxy_rules":{"dns_mode":"direct"}}"#)
                 .unwrap();
         assert!(!explicit.network_policy().dns_direct);
-        assert_eq!(explicit.proxy_rules.dns_mode, "proxy");
+        assert_eq!(explicit.dns_mode, "proxy");
+        // 收敛为单一事实来源：序列化结果不再包含 proxy_rules.dns_mode
+        let text = explicit.to_json_pretty().unwrap();
+        assert!(!text.contains("proxy_rules.dns_mode"));
     }
 
     #[test]
@@ -912,14 +916,5 @@ mod tests {
         // 回环 host 但端口不同 → 合法
         cfg.upstream.servers[0].host = "127.0.0.1".to_string();
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn check_ports_available_ok_for_defaults() {
-        // 默认端口（1080-1082）通常空闲；若被占则跳过（CI 环境不定）
-        let cfg = AppConfig::default();
-        if let Err(e) = cfg.check_ports_available() {
-            assert!(e.contains("端口"), "错误信息应含端口: {e}");
-        }
     }
 }

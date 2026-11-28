@@ -255,7 +255,8 @@ body {
 
 .settings {
   padding: 20px 24px 40px;
-  max-width: 860px;
+  width: 100%;
+  max-width: 1040px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -315,8 +316,10 @@ label.checkbox {
   margin: 6px 0;
 }
 
-input,
-select {
+/* 文本类控件统一外观；复选框/单选框保留系统外观，避免出现空心圆圈 */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
   appearance: none;
   border: 1px solid var(--border);
   background: var(--bg);
@@ -327,15 +330,31 @@ select {
   font-family: inherit;
 }
 
-input[type="checkbox"] {
+textarea {
+  resize: vertical;
+  line-height: 1.45;
+}
+
+input[type="checkbox"],
+input[type="radio"] {
   width: 15px;
   height: 15px;
   padding: 0;
+  margin: 0;
+  flex-shrink: 0;
   accent-color: var(--accent);
+  cursor: pointer;
+}
+
+input[type="checkbox"]:disabled,
+input[type="radio"]:disabled {
+  cursor: default;
+  opacity: 0.5;
 }
 
 input:focus,
-select:focus {
+select:focus,
+textarea:focus {
   outline: 2px solid color-mix(in srgb, var(--accent) 40%, transparent);
   outline-offset: -1px;
 }
@@ -346,11 +365,57 @@ select:focus {
   margin-top: 8px;
 }
 
+.rules-scroll {
+  overflow-x: auto;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
 .rules-table {
   width: 100%;
+  min-width: 980px;
   border-collapse: collapse;
-  margin: 10px 0;
+  margin: 0;
   font-size: 12px;
+}
+
+.rules-table th,
+.rules-table td {
+  white-space: nowrap;
+}
+
+.rules-table th.col-enabled,
+.rules-table td:first-child {
+  width: 44px;
+}
+
+.rules-table th.col-name {
+  width: 120px;
+}
+
+.rules-table th.col-action {
+  width: 88px;
+}
+
+.rules-table th.col-port {
+  width: 150px;
+}
+
+.rules-table th.col-protocol {
+  width: 96px;
+}
+
+.rules-table th.col-priority {
+  width: 72px;
+}
+
+.rules-table th.col-actions {
+  width: 96px;
+}
+
+.rules-table tr.dimmed {
+  opacity: 0.6;
 }
 
 .rules-table th {
@@ -378,6 +443,18 @@ select:focus {
 .rules-table input[type="checkbox"] {
   width: 14px;
   height: 14px;
+}
+
+.priority-input {
+  width: 100%;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.row-buttons {
+  display: flex;
+  gap: 2px;
+  justify-content: flex-end;
 }
 
 /* 上游快切与应用增强 */
@@ -446,4 +523,141 @@ select:focus {
   background: var(--bg);
   color: var(--text);
   resize: vertical;
+}
+
+/* ============ 设置页：新增布局与控件 ============ */
+
+.card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.card-head h2 {
+  margin: 0;
+}
+
+.field-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.checkbox-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.segmented {
+  display: flex;
+  gap: 4px;
+}
+
+.segmented-item {
+  appearance: none;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text-muted);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
+}
+
+.segmented-item.on {
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--border));
+  color: var(--accent);
+}
+
+.save-state {
+  font-size: 12px;
+  color: var(--text-muted);
+  min-width: 72px;
+  text-align: right;
+}
+
+.save-state.on {
+  color: var(--accent);
+}
+
+.spacer {
+  flex: 1;
+}
+
+.row-actions.separated {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+  margin-top: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+
+.btn-danger-text {
+  color: var(--err);
+}
+
+.undo-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0 0;
+}
+
+/* 上游：列表 + 详情 */
+.upstream-list {
+  margin-bottom: 10px;
+}
+
+.upstream-item {
+  gap: 6px;
+  padding: 0 6px 0 0;
+}
+
+.upstream-item.selected {
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+
+.upstream-pick {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-radius: 8px;
+}
+
+.upstream-pick:hover {
+  background: var(--accent-soft);
+}
+
+.upstream-detail {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg) 60%, var(--surface));
+}
+
+/* 应用：行内编辑 */
+.app-row {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.app-editor {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg) 60%, var(--surface));
 }

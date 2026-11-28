@@ -265,6 +265,8 @@ export default function Popover() {
           <dd>{status?.listen_host ?? "-"}:{status?.socks5_port ?? "-"}</dd>
           <dt>{t("popover.http")}</dt>
           <dd>{status?.listen_host ?? "-"}:{status?.http_port ?? "-"}</dd>
+          <dt>{t("popover.control")}</dt>
+          <dd>127.0.0.1:{status?.control_port ?? "-"}</dd>
         </dl>
       </section>
 
@@ -454,7 +456,7 @@ export default function Popover() {
                 <button
                   className="btn btn-small btn-ghost"
                   onClick={() => handleRemove(app.id)}
-                  title="remove"
+                  title={t("settings.remove")}
                 >
                   ×
                 </button>

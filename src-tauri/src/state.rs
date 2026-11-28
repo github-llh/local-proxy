@@ -1,14 +1,34 @@
 //! 应用共享状态：配置、核心子进程、被代理应用会话。
+//!
+//! 并发约定：
+//! - 读命令只短暂持有 `config` / `core` / `sessions`，绝不跨 IO 或等待子进程；
+//! - 需要核心重载的配置提交统一走 [`AppState::commit_config`]，
+//!   只在 `apply_lock` 内串行，网络等待（控制面 reload）不持有配置锁；
+//! - 不影响内核的本地写入（应用登记、最近启动时间）走 [`AppState::mutate_local`]，
+//!   全程持锁完成「改内存 + 落盘」，避免读改写窗口丢失其他改动；
+//! - 应用为单实例：配置目录下的 `app.lock` 由进程持有，第二个实例直接退出。
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::Child;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use localproxy_core::config::{AppConfig, ListenerInfo};
 
 use crate::control_client::ControlClient;
+
+/// 单实例锁文件名（与 `config.json` 同目录）。
+const INSTANCE_LOCK_FILENAME: &str = "app.lock";
+/// 停止被代理应用时等待进程退出的上限。
+const STOP_GRACE: Duration = Duration::from_secs(2);
+/// 单实例锁的取用重试窗口（覆盖退出后立即重启）。
+const LOCK_RETRY: Duration = Duration::from_millis(1500);
+/// 单实例锁重试间隔。
+const LOCK_RETRY_STEP: Duration = Duration::from_millis(100);
+/// 配置目录覆盖环境变量（便于多实例/测试）。
+const CONFIG_DIR_ENV: &str = "LOCALPROXY_CONFIG_DIR";
 
 /// 核心进程句柄。
 pub struct CoreProcess {
@@ -50,10 +70,21 @@ impl AppSession {
         }
     }
 
+    /// 终止本次启动的进程组，并在有限时间内等待其退出。
+    ///
+    /// 调用方不应持有 `sessions` 锁，避免界面读取被等待阻塞。
     pub fn stop(&mut self) -> std::io::Result<()> {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            self.process.kill()
+            self.process.kill()?;
+            let deadline = std::time::Instant::now() + STOP_GRACE;
+            while std::time::Instant::now() < deadline {
+                if !self.is_running() {
+                    break;
+                }
+                std::thread::park_timeout(Duration::from_millis(25));
+            }
+            Ok(())
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -72,11 +103,19 @@ pub struct AppState {
     pub core: Mutex<Option<CoreProcess>>,
     /// 被代理应用会话
     pub sessions: Mutex<Vec<AppSession>>,
+    /// 配置提交串行化：核心重载期间不持有配置锁
+    apply_lock: tokio::sync::Mutex<()>,
+    /// 核心启动串行化（命令为同步执行，使用 std 锁）
+    spawn_lock: Mutex<()>,
+    /// 同一上游的连通性测试串行化，避免并发拉起多个独立内核
+    probe_keys: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 单实例文件锁句柄：进程存活期间持有，退出时由系统释放
+    _instance_lock: std::fs::File,
 }
 
 impl AppState {
     /// 构造：加载（或创建默认）配置。
-    pub fn new() -> Self {
+    pub fn new(instance_lock: std::fs::File) -> Self {
         let config_path = default_config_path();
         let mut config = AppConfig::load(&config_path).unwrap_or_else(|e| {
             tracing::warn!("加载配置失败，使用默认值: {e}");
@@ -95,51 +134,202 @@ impl AppState {
             config_path,
             core: Mutex::new(None),
             sessions: Mutex::new(Vec::new()),
+            apply_lock: tokio::sync::Mutex::new(()),
+            spawn_lock: Mutex::new(()),
+            probe_keys: Mutex::new(HashMap::new()),
+            _instance_lock: instance_lock,
         }
     }
 
-    /// 持久化当前配置（原子写）。
-    pub fn save_config(&self) -> Result<(), String> {
-        let config = self.config.lock().map_err(|e| e.to_string())?;
-        config.save(&self.config_path)
+    /// 本地写入：不影响内核运行，全程持锁完成「改内存 + 落盘」。
+    ///
+    /// 适用于应用登记、启用状态、最近启动时间等字段；`apps` 由
+    /// `save_config` 主动保留，因此无需触发核心重载。
+    pub fn mutate_local<T>(
+        &self,
+        edit: impl FnOnce(&mut AppConfig) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut config = lock_recover(&self.config);
+        let value = edit(&mut config)?;
+        config.save(&self.config_path)?;
+        Ok(value)
     }
 
-    /// 先落盘供核心重载，核心确认后更新应用配置。调用方持有配置锁。
-    pub fn apply_config(&self, current: &mut AppConfig, mut next: AppConfig) -> Result<(), String> {
-        next.sanitize();
-        next.ensure_control_token();
-        next.validate_desktop()?;
-        let mut core = self.core.lock().map_err(|e| e.to_string())?;
-        let running = running_core(&mut core).map(|core| &core.startup_config);
-        if let Some(running) = running {
-            let mut live = next.clone();
-            live.use_running_listeners(running);
-            live.validate()?;
-        }
-        next.save(&self.config_path)?;
-        if let Some(running) = running {
-            let client =
-                ControlClient::new(running.control_endpoint(), running.control_token.clone());
-            if let Err(e) = client.reload(&next.upstream.active) {
-                current.save(&self.config_path).map_err(|rollback| {
-                    format!("核心未确认配置: {e}。恢复配置文件失败: {rollback}")
-                })?;
-                // 超时也可能发生在核心应用配置后，恢复文件后再次同步运行态。
-                if let Err(rollback) = client.reload(&current.upstream.active) {
-                    return Err(format!(
-                        "核心未确认配置: {e}。已恢复配置文件，运行状态请重启核心同步: {rollback}"
-                    ));
-                }
-                return Err(format!("核心未应用配置，已恢复原配置: {e}"));
+    /// 提交需要内核生效的配置。
+    ///
+    /// `build` 在配置读快照之后、落盘之前执行，因此可以基于最新配置做合并
+    /// （例如保留 `apps`、修正激活上游）；提交串行化由 `apply_lock` 保证。
+    pub async fn commit_config<T>(
+        &self,
+        build: impl FnOnce(&AppConfig) -> Result<(AppConfig, T), String>,
+    ) -> Result<(AppConfig, T), String> {
+        let _apply = self.apply_lock.lock().await;
+        let current = lock_recover(&self.config).clone();
+        let (next, value) = build(&current)?;
+        let applied = self.apply_locked(next).await?;
+        Ok((applied, value))
+    }
+
+    /// 校验 → 落盘 → 更新内存 → 通知运行中的核心重载。
+    ///
+    /// 控制面等待发生在配置锁之外；失败时文件与内存同时回滚。
+    async fn apply_locked(&self, mut next: AppConfig) -> Result<AppConfig, String> {
+        let (previous, running) = {
+            let mut current = lock_recover(&self.config);
+            let previous = current.clone();
+            next.sanitize();
+            next.ensure_control_token();
+            next.validate_desktop()?;
+            let running = {
+                let mut core = lock_recover(&self.core);
+                running_core(&mut core).map(|core| core.startup_config.clone())
+            };
+            if let Some(running) = &running {
+                let mut live = next.clone();
+                live.use_running_listeners(running);
+                live.validate()?;
             }
+            next.save(&self.config_path)?;
+            *current = next.clone();
+            (previous, running)
+        };
+
+        let Some(running) = running else {
+            return Ok(next);
+        };
+        let client = ControlClient::new(running.control_endpoint(), running.control_token.clone());
+        if let Err(error) = client.reload(&next.upstream.active) {
+            // 回滚：先恢复文件与内存，再让核心回到旧配置。
+            // `apps` 由独立命令维护，回滚时保留期间发生的变化。
+            let mut restored = previous.clone();
+            restored.apps.clone_from(&lock_recover(&self.config).apps);
+            let restore = restored.save(&self.config_path);
+            *lock_recover(&self.config) = restored.clone();
+            let mut message = format!("核心未应用配置: {error}");
+            if let Err(restore) = restore {
+                message.push_str(&format!("。恢复配置文件失败: {restore}"));
+            }
+            match client.reload(&restored.upstream.active) {
+                Ok(()) => message.push_str("。已恢复原配置"),
+                Err(rollback) => message.push_str(&format!(
+                    "。已恢复配置文件，运行状态请重启核心同步: {rollback}"
+                )),
+            }
+            return Err(message);
         }
-        *current = next;
-        Ok(())
+        Ok(next)
+    }
+
+    /// 运行中核心的启动配置快照（实际监听端口、控制面地址与令牌）。
+    pub fn running_startup_config(&self) -> Result<AppConfig, String> {
+        let mut guard = lock_recover(&self.core);
+        running_core(&mut guard)
+            .map(|core| core.startup_config.clone())
+            .ok_or_else(|| "LocalProxy 核心尚未运行".to_string())
+    }
+
+    /// 控制面客户端（核心未运行时返回错误）。
+    pub fn control_client(&self) -> Result<ControlClient, String> {
+        let config = self.running_startup_config()?;
+        Ok(ControlClient::new(
+            config.control_endpoint(),
+            config.control_token.clone(),
+        ))
+    }
+
+    /// 取得某个上游的探测锁，同一上游的并发测试合并为串行。
+    ///
+    /// key 取自配置中的上游 id，数量随上游数有界，无需回收。
+    pub fn probe_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        lock_recover(&self.probe_keys)
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 }
 
-/// 平台配置目录下的 config.json（无第三方依赖，读环境变量）。
-pub fn default_config_path() -> PathBuf {
+/// 取锁并在锁中毒时继续使用内部数据（读命令不应因一次 panic 全线失败）。
+pub fn lock_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// 单实例锁的取用结果。
+enum LockState {
+    Acquired(std::fs::File),
+    /// 已有实例持有该锁
+    Busy,
+    Failed(String),
+}
+
+/// 获取单实例锁。
+///
+/// `Ok` 表示当前进程是唯一实例，句柄需随进程存活；`Err` 说明已有实例在运行。
+///
+/// 退出后立刻重启（旧进程仍在收尾）时锁会短暂不可用，因此在
+/// [`LOCK_RETRY`] 时间内重试，避免把「重启」误判成「已有实例」。
+pub fn acquire_instance_lock() -> Result<std::fs::File, String> {
+    let path = config_directory().join(INSTANCE_LOCK_FILENAME);
+    let deadline = std::time::Instant::now() + LOCK_RETRY;
+    loop {
+        match try_lock_file(&path) {
+            LockState::Acquired(file) => return Ok(file),
+            LockState::Busy if std::time::Instant::now() < deadline => {
+                std::thread::park_timeout(LOCK_RETRY_STEP);
+            }
+            LockState::Busy => {
+                return Err(
+                    "LocalProxy 已在运行，请从菜单栏图标打开面板（可用 LOCALPROXY_CONFIG_DIR 指定独立配置目录以并行运行）"
+                        .to_string(),
+                )
+            }
+            LockState::Failed(message) => return Err(message),
+        }
+    }
+}
+
+/// 对指定路径取独占锁。
+fn try_lock_file(path: &std::path::Path) -> LockState {
+    if let Some(parent) = path.parent() {
+        if let Err(error) = std::fs::create_dir_all(parent) {
+            return LockState::Failed(format!("创建配置目录失败: {error}"));
+        }
+    }
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            return LockState::Failed(format!("打开单实例锁失败 ({}): {error}", path.display()))
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => LockState::Acquired(file),
+        Err(std::fs::TryLockError::WouldBlock) => LockState::Busy,
+        Err(std::fs::TryLockError::Error(error)) => {
+            LockState::Failed(format!("单实例锁不可用: {error}"))
+        }
+    }
+}
+
+/// 配置目录：默认平台配置目录，可用 `LOCALPROXY_CONFIG_DIR` 覆盖。
+///
+/// 覆盖后可并行运行多个实例（各自独立配置与单实例锁），
+/// 便于测试、多账号或与默认安装共存。
+pub fn config_directory() -> PathBuf {
+    config_directory_from(std::env::var_os(CONFIG_DIR_ENV))
+}
+
+/// 覆盖值优先；未设置或为空时回退平台配置目录。
+fn config_directory_from(override_dir: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(directory) = override_dir {
+        if !directory.is_empty() {
+            return PathBuf::from(directory);
+        }
+    }
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support"))
     } else if cfg!(target_os = "windows") {
@@ -151,7 +341,11 @@ pub fn default_config_path() -> PathBuf {
     };
     base.unwrap_or_else(|| PathBuf::from("."))
         .join("local-proxy")
-        .join("config.json")
+}
+
+/// 平台配置目录下的 config.json。
+pub fn default_config_path() -> PathBuf {
+    config_directory().join("config.json")
 }
 
 /// 安装包与开发构建使用同名核心和 shim。
@@ -192,17 +386,23 @@ fn packaged_or_development(name: &str) -> PathBuf {
 }
 
 /// 启动本地核心子进程。
+///
+/// 启动串行化，且等待核心首行期间不持有配置锁与核心锁，
+/// 避免菜单栏轮询在启动窗口内被阻塞。
 pub fn spawn_core(state: &AppState) -> Result<u32, String> {
-    let config = state.config.lock().map_err(|e| e.to_string())?;
-    let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-    if let Some(core) = running_core(&mut guard) {
-        return Ok(core.child.id());
+    let _spawn = lock_recover(&state.spawn_lock);
+    {
+        let mut guard = lock_recover(&state.core);
+        if let Some(core) = running_core(&mut guard) {
+            return Ok(core.child.id());
+        }
     }
 
     let binary = core_binary_path();
     if !binary.exists() {
         return Err(format!("核心二进制不存在: {}", binary.display()));
     }
+    let config_snapshot = lock_recover(&state.config).clone();
 
     let mut command = std::process::Command::new(&binary);
     localproxy_launcher::proxy_env::remove_from(&mut command);
@@ -255,9 +455,17 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
         let _ = stop_child(&mut child);
         return Err("核心未提供运行期策略，请更新核心程序".to_string());
     };
-    let mut startup_config = config.clone();
+    let mut startup_config = config_snapshot;
     startup_config.set_listener_info(info);
     let pid = child.id();
+
+    let mut guard = lock_recover(&state.core);
+    if let Some(existing) = running_core(&mut guard) {
+        // 并发路径已启动核心：回收本次启动的进程，复用既有句柄。
+        let _ = stop_child(&mut child);
+        let _ = std::fs::remove_file(&policy_path);
+        return Ok(existing.child.id());
+    }
     *guard = Some(CoreProcess {
         child,
         started_at: std::time::Instant::now(),
@@ -269,13 +477,17 @@ pub fn spawn_core(state: &AppState) -> Result<u32, String> {
 }
 
 /// 停止本地核心。
+///
+/// 先摘出句柄再等待子进程退出：等待期间菜单栏轮询看到的是「已停止」，
+/// 不会被 2 秒的收尾过程阻塞。
 pub fn kill_core(state: &AppState) -> Result<(), String> {
-    let mut guard = state.core.lock().map_err(|e| e.to_string())?;
-    if let Some(mut core) = guard.take() {
-        let _ = std::fs::remove_file(&core.policy_path);
-        stop_child(&mut core.child).map_err(|e| format!("停止核心失败: {e}"))?;
-        tracing::info!("核心已停止");
-    }
+    let taken = lock_recover(&state.core).take();
+    let Some(mut core) = taken else {
+        return Ok(());
+    };
+    let _ = std::fs::remove_file(&core.policy_path);
+    stop_child(&mut core.child).map_err(|e| format!("停止核心失败: {e}"))?;
+    tracing::info!("核心已停止");
     Ok(())
 }
 
@@ -319,5 +531,56 @@ mod tests {
     fn core_binary_path_resolves() {
         let p = core_binary_path();
         assert!(p.to_string_lossy().contains("localproxy-core"));
+    }
+
+    #[test]
+    fn instance_lock_rejects_second_holder() {
+        let directory = std::env::temp_dir().join(format!(
+            "localproxy-lock-{}",
+            localproxy_core::config::generate_token()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(INSTANCE_LOCK_FILENAME);
+
+        let first = match try_lock_file(&path) {
+            LockState::Acquired(file) => file,
+            LockState::Busy => panic!("首个实例不应被判定为占用"),
+            LockState::Failed(message) => panic!("首个实例取锁失败: {message}"),
+        };
+        // 同一文件的第二个持有者在 unix 文件锁语义下被拒绝；
+        // Windows 的字节范围锁语义由系统决定，这里不做断言。
+        let second = try_lock_file(&path);
+        #[cfg(unix)]
+        assert!(
+            matches!(second, LockState::Busy),
+            "第二个实例应被判定为占用"
+        );
+        #[cfg(not(unix))]
+        drop(second);
+
+        // 其它路径互不影响（LOCALPROXY_CONFIG_DIR 可让多实例各用一份配置）
+        let other = directory.join("other.lock");
+        assert!(
+            matches!(try_lock_file(&other), LockState::Acquired(_)),
+            "其它路径应可加锁"
+        );
+
+        drop(first);
+        std::fs::remove_dir_all(&directory).ok();
+    }
+
+    #[test]
+    fn config_directory_honours_override() {
+        // 纯函数形式便于断言，避免测试之间争用进程环境变量
+        assert_eq!(
+            config_directory_from(Some("/tmp/localproxy-override".into())),
+            PathBuf::from("/tmp/localproxy-override")
+        );
+        assert!(config_directory_from(None).ends_with("local-proxy"));
+        assert_eq!(
+            config_directory_from(Some(std::ffi::OsString::new())),
+            config_directory_from(None),
+            "空覆盖值应回退默认目录"
+        );
     }
 }

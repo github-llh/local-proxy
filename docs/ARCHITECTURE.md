@@ -8,7 +8,7 @@
 │   tray 图标（左键 popover / 右键菜单）                        │
 │   popover：核心状态、上游切换、运行中应用、应用快速启动        │
 │   settings：监听 / 上游 / 路由规则 / DNS·UDP / 高级            │
-│   启动时拉起 ②（sidecar 子进程），退出时按设置决定是否保留     │
+│   启动时拉起 ②（sidecar 子进程），退出时结束子进程与临时配置   │
 └──────────────────────────┬───────────────────────────────────┘
                            │ std::process（spawn localproxy-core）
 ┌──────────────────────────▼───────────────────────────────────┐
@@ -45,15 +45,15 @@ UDP：`udp_mode=auto` + SOCKS5 上游时走 UDP Associate；其它上游按
 
 ## crate 职责
 
-| crate | 职责 |
-|:--|:--|
-| `localproxy-net` | 共享协议库：SOCKS5/HTTP 客户端、FakeIP、域名映射、本地目标判定、纯协议构造/解析 |
-| `localproxy-core` | 代理核心：服务、规则、上游、DNS、统计、CLI |
-| `localproxy-shim` | shim 公共逻辑：FakeIP 映射、SockIo 抽象、就地协商、重入防护 |
-| `localproxy-shim-macos` | `#![cfg(target_os="macos")]` interpose dylib |
-| `localproxy-shim-win` | `#![cfg(windows)]` MinHook dylib |
-| `localproxy-launcher` | 平台启动器（.app 解析/exec、CreateProcess 注入） |
-| `src-tauri` | Tauri 壳：tray/窗口/命令层/状态 |
+| crate                   | 职责                                                |
+|:------------------------|:--------------------------------------------------|
+| `localproxy-net`        | 共享协议库：SOCKS5/HTTP 客户端、FakeIP、域名映射、本地目标判定、纯协议构造/解析 |
+| `localproxy-core`       | 代理核心：服务、规则、上游、DNS、统计、CLI                          |
+| `localproxy-shim`       | shim 公共逻辑：FakeIP 映射、SockIo 抽象、就地协商、重入防护           |
+| `localproxy-shim-macos` | `#![cfg(target_os="macos")]` interpose dylib      |
+| `localproxy-shim-win`   | `#![cfg(windows)]` MinHook dylib                  |
+| `localproxy-launcher`   | 平台启动器（.app 解析/exec、CreateProcess 注入）              |
+| `src-tauri`             | Tauri 壳：tray/窗口/命令层/状态                            |
 
 ## 关键设计决策
 
@@ -68,3 +68,8 @@ UDP：`udp_mode=auto` + SOCKS5 上游时走 UDP Associate；其它上游按
    `cargo check --workspace` 都不会构建对方平台源码；
 5. **配置单一事实来源**：`localproxy-core::config::AppConfig`，
    App 与 CLI 共用；所有非法值 warn + 回退默认（移植旧项目 fail-safe 语义）。
+6. **单实例 + 写串行化**：App 用配置目录下的 `app.lock`（`File::try_lock`）
+   保证只有一个实例，第二个实例直接退出；`LOCALPROXY_CONFIG_DIR` 指向独立
+   配置目录即可并行运行（各自配置、锁与端口避让）。配置写入统一走
+   `commit_config`（`apply_lock` 串行 → 落盘 → 更新内存 → 通知核心重载），
+   控制面等待不持有配置锁，应用登记等本地写入走 `mutate_local` 全程持锁。

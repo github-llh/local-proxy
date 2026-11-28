@@ -10,6 +10,7 @@ export interface CoreStatus {
   listen_host: string;
   socks5_port: number;
   http_port: number;
+  control_port: number;
   active_upstream: string;
   active_upstream_id: string;
   upstream_type: string;
@@ -73,6 +74,7 @@ export interface UpstreamServer {
 }
 
 export interface RoutingRule {
+  id: string;
   name: string;
   enabled: boolean;
   action: string;
@@ -122,17 +124,14 @@ export interface AppConfig {
   dns_mode: string;
   proxy_rules: {
     allowed_ports: number[];
-    dns_mode: string;
     ipv6_mode: string;
     udp_mode: string;
     udp_fallback: string;
-    routing: unknown;
   };
   apps: AppEntry[];
   ui: {
     language: string;
     launch_at_login: boolean;
-    keep_core_alive: boolean;
     exit_ip_probe: boolean;
   };
   probe: {
@@ -148,6 +147,16 @@ export const api = {
   listApps: () => invoke<AppEntry[]>("list_apps"),
   addApp: (path: string) => invoke<AppEntry>("add_app", {path}),
   removeApp: (id: string) => invoke<void>("remove_app", {id}),
+  updateApp: (
+    id: string,
+    patch: { name?: string; note?: string; extraArgs?: string[]; enabled?: boolean },
+  ) => invoke<AppEntry>("update_app", {
+    id,
+    name: patch.name,
+    note: patch.note,
+    extraArgs: patch.extraArgs,
+    enabled: patch.enabled,
+  }),
   launchApp: (id: string) => invoke<SessionInfo>("launch_app", {id}),
   stopApp: (id: string) => invoke<void>("stop_app", {id}),
   listSessions: () => invoke<SessionInfo[]>("list_sessions"),

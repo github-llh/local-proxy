@@ -479,6 +479,7 @@ impl RuleEngine {
 /// 默认内网直连规则（移植旧 `default-private`，含 UDP 覆盖）。
 fn default_private_rule() -> RoutingRule {
     RoutingRule {
+        id: "default-private".to_string(),
         name: "default-private".to_string(),
         enabled: true,
         action: "direct".to_string(),

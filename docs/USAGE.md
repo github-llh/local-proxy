@@ -23,7 +23,9 @@ target/debug/localproxy-core --config ./config.json
 1. 启动 App：菜单栏出现 LocalProxy 图标，本地核心自动拉起（SOCKS5 1080 / HTTP 1081）；
 2. 点击图标打开 popover → 「+ 添加」选择应用（macOS `.app` / Windows `.exe`）；
 3. 点击应用的「代理启动」，由当前平台的注入层接管已覆盖的网络 API，并按规则分流；
-4. 右键托盘图标 →「设置」：配置上游、路由规则、DNS/UDP、开机自启。
+4. 右键托盘图标 →「设置」：配置监听、上游、路由规则、DNS/UDP、应用、高级项。
+   设置页的改动在点击「保存」后生效（`⌘/Ctrl + S` 亦可），标题栏会提示
+   「未保存的更改」；「重新加载」丢弃草稿并读取磁盘上的当前配置。
 
 ## 上游配置
 
@@ -74,6 +76,9 @@ mihomo。「检查节点配置」验证内核能否加载并启动该节点，�
 - 规则字段：域名（支持 `.cn` 后缀与 `*.example.com` 通配）、IPv4/IPv6 CIDR、
   端口（`443` / `10000-20000`）、协议（tcp/udp）；
 - 优先级：`order`（数组序，首个命中生效）或 `number`（priority 降序）；
+  设置页的规则表可编辑全部字段（域名、IPv4/IPv6 CIDR、端口、协议、优先级），
+  `order` 模式下用上移/下移调整顺序，`number` 模式下才启用优先级输入；
+- 可用「启用路由规则」整体关闭规则表（关闭后按默认动作处理）；
 - 内网/回环地址默认自动直连（可关闭）。
 
 ## DNS 和 UDP 策略
@@ -107,6 +112,12 @@ popover「风控自检」卡片（探测默认关闭，在设置 → 高级开�
 
 ## 共存与泄漏边界
 
+- **单实例**：App 用配置目录下的 `app.lock` 保证同时只有一个实例，第二个实例给出提示后退出
+  （macOS 显示系统通知），不会出现两个菜单栏图标争抢端口。退出后立刻重启时锁会在 1.5 秒内重试，
+  不会误判为「已在运行」。
+- **并行多实例**：设置环境变量 `LOCALPROXY_CONFIG_DIR` 指向独立目录即可再开一个实例，
+  它使用自己的 `config.json`、单实例锁与端口避让，因此可以与默认安装并存（多账号、测试）。
+  CLI 的 `localproxy-core --config` 本来就按文件路径工作，不受单实例限制。
 - **端口**：桌面核心检测已配置或被其他服务占用的端口，自动使用空闲回环端口，菜单栏显示实际端口。偏好端口保留在设置中，重启时重新尝试。CLI
   使用明确配置的监听端口。
 - **系统设置**：LocalProxy 仅从自己启动的应用和内核环境中移除代理环境变量。系统代理、PAC、DNS、TUN、路由表及现有代理进程由原软件管理。
@@ -138,14 +149,35 @@ Windows `%APPDATA%/local-proxy/`）由 App 自动维护，也可手改：
 {
   "socks5_port": 1080,
   "http_port": 1081,
+  "control_port": 1082,
   "upstream": {
     "active": "clash",
     "servers": [{ "id": "clash", "name": "Clash", "type": "socks5",
                    "host": "127.0.0.1", "port": 7890 }]
   },
-  "routing": { "default_action": "proxy", "use_default_private": true },
-  "dns_mode": "proxy",
+  "routing": {
+    "enabled": true,
+    "priority_mode": "order",
+    "default_action": "proxy",
+    "use_default_private": true,
+    "rules": [{
+      "id": "rule-0",                 // 界面行 key；缺失时自动补齐
+      "name": "内网域名",
+      "enabled": true,
+      "action": "direct",
+      "priority": 0,                  // 仅 priority_mode=number 时参与排序
+      "domains": [".corp.example.com"],
+      "ip_cidrs_v4": ["10.10.0.0/16"],
+      "ip_cidrs_v6": [],
+      "ports": ["443"],
+      "protocols": ["tcp"]            // 空数组 = tcp/udp 都匹配
+    }]
+  },
+  "dns_mode": "proxy",                // DNS 模式的唯一来源
   "proxy_rules": { "udp_mode": "auto", "udp_fallback": "block" },
   "apps": [{ "id": "chrome", "name": "Chrome", "path": "/Applications/Google Chrome.app" }]
 }
 ```
+
+旧配置里的 `proxy_rules.dns_mode` 仍可读取：加载时会提升为顶层 `dns_mode`，
+保存后只保留顶层字段。
