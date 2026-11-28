@@ -93,11 +93,10 @@ impl ClashClient {
     }
 
     pub async fn snapshot(&self) -> Result<ClashState, String> {
-        // 两个只读请求互不依赖，并发发出
-        let (config, proxies) = tokio::try_join!(
-            self.get_json::<ClashConfig>("configs"),
-            self.get_json::<ProxiesResponse>("proxies"),
-        )?;
+        // 逐个请求：本机两次往返可忽略，换来确定的失败点与可测性
+        // （并发只省不到 1ms，却让错误来源依赖调度顺序）
+        let config: ClashConfig = self.get_json("configs").await?;
+        let proxies: ProxiesResponse = self.get_json("proxies").await?;
         let mode = config.mode.to_ascii_lowercase();
         let groups = proxies
             .proxies
@@ -499,7 +498,7 @@ mod tests {
             address: listener.local_addr().unwrap().to_string(),
             secret: "wrong".to_string(),
         };
-        tokio::spawn(async move {
+        let server = tokio::spawn(async move {
             let (socket, _) = listener.accept().await.unwrap();
             let mut stream = BufReader::new(socket);
             read_request(&mut stream).await;
@@ -509,6 +508,8 @@ mod tests {
         });
         let client = ClashClient::new(&controller).unwrap();
         let error = client.snapshot().await.unwrap_err();
+        // 服务端只处理一个连接：串行请求保证首个（configs）就拿到 401
+        server.await.unwrap();
         assert!(error.contains("Secret"), "应提示 Secret 问题: {error}");
     }
 

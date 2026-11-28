@@ -5,6 +5,7 @@ LocalProxy：跨平台本地代理（菜单栏 + per-app 启动注入，无 TUN�
 - 构建体系：Cargo workspace（Rust）+ Tauri v2（src-tauri）+ Vite/React（ui/）。
 - 代码规范：`cargo fmt --all` + `cargo clippy --workspace -- -D warnings` 必须零警告；前端 `pnpm --dir ui build`（tsc + vite）必须通过。
 - 测试：`cargo test --workspace` 全绿是提交前提；改动平台 `cfg` 代码后跑 `scripts/check-linux-cfg.sh`（Linux 分支的 dead_code / 未使用依赖只能这样在本地暴露）。
+- 涉及网络/并发/时序的测试至少重复运行 10 次：单次通过不代表稳定（CI 不同平台的调度会暴露偶发失败）。
 - 发布流程见 [Agent.md](Agent.md)。
 - Rust 工具链位于 `~/.cargo/bin`（非登录 shell 需 `export PATH="$HOME/.cargo/bin:$PATH"`）。
 
